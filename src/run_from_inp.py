@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
-Executa análise a partir de um arquivo .inp.
-Detecta o tipo (estática ou térmica) e chama a função apropriada.
+Executa a analise de um .inp do CalculiX (um caminho so, guiado pelo deck).
+
+Estatica linear (C3D4, C3D8, C3D10; varios *STEP; *CLOAD; *DLOAD pressao) e
+termica estacionaria. O que nao e implementado falha com erro explicito
+(inp_capabilities.py). ``--profile fc`` so acrescenta as restricoes do perfil
+FC; ``--restrictions`` aplica as restricoes do arquivo de configuracao.
 """
 
 import json
@@ -18,7 +22,11 @@ import ufl
 import basix.ufl
 
 sys.path.insert(0, "/app/src")
-from inp_parser import parse_inp, summary, Step, select_analysis, get_material_for_element
+from inp_parser import (
+    parse_inp, summary, Step, select_analysis, get_material_for_element,
+    effective_steps, materials_by_element_strict,
+)
+from inp_capabilities import apply_restrictions, ignored_items, validate_capabilities
 from job_io import (
     USAGE,
     parse_run_args,
@@ -50,11 +58,15 @@ from fc_assembly import (
     residual_on_constrained,
 )
 from fc_solver import SOLVER_LU, solve_linear
-from job_io import normalize_rtol, normalize_solver
+from job_io import SOLVER_AUTO, normalize_rtol, normalize_solver
 
 
 def build_mesh_from_inp(model, debug=0):
-    """Constrói uma malha DOLFINx a partir do modelo INP."""
+    """Constroi a malha DOLFINx a partir do modelo INP (C3D4, C3D8, C3D10).
+
+    C3D10 usa geometria quadratica (os nos de meio de aresta do .inp entram na
+    geometria), entao arestas curvas sao respeitadas como no CalculiX.
+    """
     if not model.elements:
         raise ValueError("Nenhum elemento encontrado no .inp")
 
@@ -67,182 +79,219 @@ def build_mesh_from_inp(model, debug=0):
     coords = np.array([[model.nodes[nid].x, model.nodes[nid].y, model.nodes[nid].z]
                        for nid in node_ids], dtype=np.float64)
 
+    if etype == "C3D10":
+        # Ordem CalculiX/Abaqus do C3D10 = ordem VTK (VTK_QUADRATIC_TETRA).
+        from dolfinx.io import VTKFile  # noqa: F401  (garante o modulo io)
+        from dolfinx.cpp.io import perm_vtk
+        from dolfinx.mesh import CellType
+        perm = np.asarray(perm_vtk(CellType.tetrahedron, 10), dtype=np.int64)
+    else:
+        perm = None
+
     cells = []
     for el in model.elements.values():
         if el.type.upper() != etype:
             raise ValueError(f"Elementos mistos não suportados ({el.type} vs {etype})")
-        nodes = [node_map[n] for n in el.nodes]
+        try:
+            nodes = [node_map[n] for n in el.nodes]
+        except KeyError as exc:
+            raise ValueError(f"Elemento {el.id} referencia no inexistente: {exc}") from exc
         if etype == "C3D8" and len(nodes) == 8:
             nodes = [nodes[0], nodes[1], nodes[3], nodes[2],
                      nodes[4], nodes[5], nodes[7], nodes[6]]
+        elif perm is not None:
+            nodes = [nodes[int(p)] for p in perm]
         cells.append(nodes)
-    cells = np.array(cells, dtype=np.int32)
+    cells = np.array(cells, dtype=np.int64 if etype == "C3D10" else np.int32)
 
+    degree = 1
     if etype == "C3D8":
         cell_name = "hexahedron"
     elif etype == "C3D4":
         cell_name = "tetrahedron"
+    elif etype == "C3D10":
+        cell_name = "tetrahedron"
+        degree = 2
     else:
         raise ValueError(f"Tipo de elemento não suportado: {etype}")
+
+    if etype == "C3D10":
+        # So os nos usados pelos elementos entram na geometria quadratica.
+        used = np.unique(cells.reshape(-1))
+        remap = -np.ones(coords.shape[0], dtype=np.int64)
+        remap[used] = np.arange(used.size)
+        coords = coords[used]
+        cells = remap[cells]
 
     if debug:
         print(f"Malha: {len(node_ids)} nós, {len(cells)} elementos ({etype})")
 
-    coord_element = basix.ufl.element("Lagrange", cell_name, 1, shape=(coords.shape[1],))
+    coord_element = basix.ufl.element("Lagrange", cell_name, degree, shape=(coords.shape[1],))
     ufl_mesh = ufl.Mesh(coord_element)
     domain = mesh.create_mesh(MPI.COMM_WORLD, cells, ufl_mesh, coords)
     return domain, node_map
 
 
+def element_degree(model) -> int:
+    """Grau do espaco de deslocamento: 2 para C3D10, 1 para C3D4/C3D8."""
+    first = next(iter(model.elements.values()))
+    return 2 if first.type.upper() == "C3D10" else 1
+
+
+def resolve_solver_choice(solver: str, ndofs: int, auto_lu_max_dofs):
+    """Escolhe lu ou cg-gamg. ``auto``: abaixo do limite da configuracao -> lu, senao cg-gamg."""
+    if solver != SOLVER_AUTO:
+        return solver, None
+    if auto_lu_max_dofs is None:
+        raise ValueError("--solver auto exige --auto-lu-max-dofs (limite definido na configuracao)")
+    chosen = "lu" if ndofs < int(auto_lu_max_dofs) else "cg-gamg"
+    return chosen, {
+        "requested": "auto",
+        "n_dofs": int(ndofs),
+        "auto_lu_max_dofs": int(auto_lu_max_dofs),
+        "chosen": chosen,
+        "rule": "n_dofs < auto_lu_max_dofs -> lu; senao cg-gamg",
+    }
+
+
+class StaticContext:
+    """Malha, espacos, materiais e forma bilinear: montados uma vez para todos os passos."""
+
+    def __init__(self, model, debug=0, stages=None, t0=None):
+        t0 = t0 if t0 is not None else time.perf_counter()
+        self.t0 = t0
+        self.stages = stages
+        domain, node_map = build_mesh_from_inp(model, debug=debug)
+        log_fc_stage("mesh", t0, stages)
+        domain.topology.create_connectivity(0, domain.topology.dim)
+        domain.topology.create_connectivity(domain.topology.dim, 0)
+        self.domain = domain
+        self.nid_to_geom = inp_node_to_geom(domain, model)
+        log_fc_stage("inp_node_to_geom", t0, stages)
+        self.eid_to_cell = inp_element_to_cell(domain, model, self.nid_to_geom)
+        log_fc_stage("inp_element_to_cell", t0, stages)
+        if debug:
+            print(f"Mapa INP->geom: {len(self.nid_to_geom)} nos; INP->celula: {len(self.eid_to_cell)} elems")
+        self.degree = element_degree(model)
+        self.etype = next(iter(model.elements.values())).type.upper()
+        self.V = fem.functionspace(domain, ("Lagrange", self.degree, (domain.geometry.dim,)))
+        log_fc_stage("functionspace", t0, stages)
+
+        # Materiais por celula (DG-0), via *SOLID SECTION, sem material padrao.
+        mats = materials_by_element_strict(model, "elastic")
+        Q = fem.functionspace(domain, ("DG", 0))
+        E_func = fem.Function(Q)
+        nu_func = fem.Function(Q)
+        ncell = E_func.x.array.size
+        for eid, mat in mats.items():
+            cell_idx = self.eid_to_cell[eid]
+            if cell_idx >= ncell:
+                raise RuntimeError("Indice de celula fora do espaco DG0 (serial esperado).")
+            E_func.x.array[cell_idx] = mat.E
+            nu_func.x.array[cell_idx] = mat.nu
+        E_func.x.scatter_forward()
+        nu_func.x.scatter_forward()
+        log_fc_stage("materials", t0, stages)
+        if debug:
+            print(f"Materiais aplicados: E min={E_func.x.array.min():.0f}, max={E_func.x.array.max():.0f}")
+        self.E = E_func
+        self.nu = nu_func
+        mu = E_func / (2.0 * (1.0 + nu_func))
+        lmbda = E_func * nu_func / ((1.0 + nu_func) * (1.0 - 2.0 * nu_func))
+
+        def epsilon(u):
+            return ufl.sym(ufl.grad(u))
+
+        def sigma(u):
+            return lmbda * ufl.nabla_div(u) * ufl.Identity(len(u)) + 2.0 * mu * epsilon(u)
+
+        self.epsilon = epsilon
+        self.sigma = sigma
+        u = ufl.TrialFunction(self.V)
+        self.v = ufl.TestFunction(self.V)
+        a = ufl.inner(sigma(u), epsilon(self.v)) * ufl.dx
+        L_form = ufl.dot(fem.Constant(domain, default_scalar_type((0.0, 0.0, 0.0))), self.v) * ufl.dx
+        self.a_form = fem.form(a)
+        self.L_compiled = fem.form(L_form)
+        self.ndofs = int(self.V.dofmap.index_map.size_global * self.V.dofmap.index_map_bs)
+
+
 def run_linear_static_step(model, step, output_base: str, debug: int = 0, profile: str = None,
-                           solver: str = "lu", rtol: float = 1e-10):
-    """Executa um step de estatica linear com multiplos materiais."""
-    profile_fc = (profile or "").strip().lower() == "fc"
+                           solver: str = "lu", rtol: float = 1e-10, ctx: "StaticContext" = None,
+                           auto_lu_max_dofs=None):
+    """Um passo de estatica linear. ``step`` e o estado efetivo do passo (effective_steps)."""
     solver = normalize_solver(solver)
     rtol = normalize_rtol(rtol, solver)
-    require_serial_fc(MPI.COMM_WORLD, profile_fc)
-    t0 = time.perf_counter()
+    require_serial_fc(MPI.COMM_WORLD, True)
     stages = [] if mem_profile_enabled() else None
-    domain, node_map = build_mesh_from_inp(model, debug=debug)
-    log_fc_stage("mesh", t0, stages)
+    if ctx is None:
+        ctx = StaticContext(model, debug=debug, stages=stages)
+    t0 = ctx.t0
+    stages = ctx.stages
+    domain, V = ctx.domain, ctx.V
+    solver_used, auto_info = resolve_solver_choice(solver, ctx.ndofs, auto_lu_max_dofs)
 
-    domain.topology.create_connectivity(0, domain.topology.dim)
-    domain.topology.create_connectivity(domain.topology.dim, 0)
-
-    nid_to_geom = inp_node_to_geom(domain, model)
-    log_fc_stage("inp_node_to_geom", t0, stages)
-    eid_to_cell = inp_element_to_cell(domain, model, nid_to_geom)
-    log_fc_stage("inp_element_to_cell", t0, stages)
-    if debug:
-        print(f"Mapa INP->geom: {len(nid_to_geom)} nos; INP->celula: {len(eid_to_cell)} elems")
-
-    V = fem.functionspace(domain, ("Lagrange", 1, (domain.geometry.dim,)))
-    log_fc_stage("functionspace", t0, stages)
-
-    # Materiais por célula (DG-0). Indices de celula via mapa INP, nao enumeracao crua.
-    Q = fem.functionspace(domain, ("DG", 0))
-    E_func = fem.Function(Q)
-    nu_func = fem.Function(Q)
-
-    if not model.materials:
-        raise ValueError("Nenhum material *ELASTIC encontrado no .inp")
-    default_mat = next(iter(model.materials.values()))
-    if profile_fc and (default_mat.E <= 0):
-        raise FCProfileError("Perfil FC exige *ELASTIC com E e nu informados (sem default silencioso).")
-    E_func.x.array[:] = default_mat.E if default_mat.E > 0 else 210000
-    nu_func.x.array[:] = default_mat.nu if default_mat.nu > 0 else 0.3
-
-    for eid in model.elements:
-        mat = get_material_for_element(model, eid)
-        if mat is None:
-            continue
-        cell_idx = eid_to_cell[eid]
-        if cell_idx < len(E_func.x.array):
-            if profile_fc and mat.E <= 0:
-                raise FCProfileError("Material sem E no perfil FC.")
-            E_func.x.array[cell_idx] = mat.E if mat.E > 0 else 210000
-            nu_func.x.array[cell_idx] = mat.nu if mat.nu > 0 else 0.3
-
-    E_func.x.scatter_forward()
-    nu_func.x.scatter_forward()
-    log_fc_stage("materials", t0, stages)
-
-    if debug:
-        print(f"Materiais aplicados: E min={E_func.x.array.min():.0f}, max={E_func.x.array.max():.0f}")
-
-    E = E_func
-    nu = nu_func
-    mu = E / (2.0 * (1.0 + nu))
-    lmbda = E * nu / ((1.0 + nu) * (1.0 - 2.0 * nu))
-
-    bcs, constrained_rows = collect_constrained_dofs(V, model, profile_fc)
+    boundary = step.boundary if step.boundary is not None else model.boundary
+    bcs, constrained_rows = collect_constrained_dofs(V, model, True, boundary=boundary)
     log_fc_stage("collect_constrained_dofs", t0, stages)
-    if profile_fc and not constrained_rows:
+    if not constrained_rows:
         raise RuntimeError(
-            "Perfil FC recusa sistema sem DOFs prescritos (*BOUNDARY). "
+            "Recusado: sistema sem DOFs prescritos (*BOUNDARY). "
             "Ha modos de corpo rigido; uma fatoracao LU que nao acusa "
             "singularidade nao conta como sucesso."
         )
 
-    def epsilon(u):
-        return ufl.sym(ufl.grad(u))
-
-    def sigma(u):
-        return lmbda * ufl.nabla_div(u) * ufl.Identity(len(u)) + 2.0 * mu * epsilon(u)
-
-    u = ufl.TrialFunction(V)
-    v = ufl.TestFunction(V)
-    a = ufl.inner(sigma(u), epsilon(v)) * ufl.dx
-    L_form = ufl.dot(fem.Constant(domain, default_scalar_type((0.0, 0.0, 0.0))), v) * ufl.dx
-
-    a_form = fem.form(a)
-    L_compiled = fem.form(L_form)
-
-    # RF usa assemble_vector da forma (K u esparso), nao uma copia densa nem A_full.
-    # Matriz com BC so no solve.
-    A = assemble_matrix(a_form, bcs=bcs)
+    A = assemble_matrix(ctx.a_form, bcs=bcs)
     A.assemble()
     log_fc_stage("assemble_A", t0, stages)
-    b = assemble_vector(L_compiled)
+    b = assemble_vector(ctx.L_compiled)
     log_fc_stage("assemble_b", t0, stages)
 
-    applied = apply_cloads(V, b, model, step, profile_fc)
+    applied = apply_cloads(V, b, model, step, True)
     log_fc_stage("apply_cloads", t0, stages)
 
     if step.dloads:
-        if profile_fc:
-            raise FCProfileError("Perfil FC rejeita *DLOAD (sem heuristicas de pressao).")
-        # Recorte antigo (nao FC): contribuicao nodal aproximada; nao usar como pressao real.
-        coords = domain.geometry.x
-        for dl in step.dloads:
-            for elset_name, elem_ids in model.elsets.items():
-                if elset_name.upper() == dl.elset.upper():
-                    for eid in elem_ids:
-                        if eid in model.elements:
-                            for nid in model.elements[eid].nodes:
-                                if nid in model.nodes:
-                                    n = model.nodes[nid]
-                                    dist = np.linalg.norm(coords - np.array([n.x, n.y, n.z]), axis=1)
-                                    node_idx = np.argmin(dist)
-                                    if dist[node_idx] < 1e-6:
-                                        dof_z = node_idx * 3 + 2
-                                        with b.localForm() as local:
-                                            if dof_z < local.size:
-                                                local[dof_z] += dl.value * 0.05
-                    break
+        from fc_pressure import apply_pressure_loads
+        p_applied = apply_pressure_loads(ctx, b, model, step)
+        for key in ("Fx", "Fy", "Fz"):
+            applied[key] += p_applied["F"][key]
+        applied["pressure"] = p_applied
+        log_fc_stage("apply_dloads", t0, stages)
 
     f_ext = b.copy()
 
-    apply_lifting(b, [a_form], [bcs])
+    apply_lifting(b, [ctx.a_form], [bcs])
     b.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
     set_bc(b, bcs)
 
     uh = fem.Function(V)
     solver_info = solve_linear(
-        A, b, uh, V, solver=solver, rtol=rtol, debug=debug,
+        A, b, uh, V, solver=solver_used, rtol=rtol, debug=debug,
     )
+    if auto_info:
+        solver_info["auto"] = auto_info
     log_fc_stage("solve", t0, stages)
     uh.name = "displacement"
 
     write_vtk_function(domain.comm, uh, output_base, debug=debug)
-    honored = ["U"]
-    artifacts = [{"path": output_base + ".pvd", "field": "U", "location": "nodal-CG1"}]
-    extra = {
-        "honored": honored, "artifacts": artifacts, "reactions": None,
-        "applied": applied, "solver_info": solver_info,
-    }
-
-    if profile_fc:
-        fields = _write_fc_linear_fields(
-            domain, uh, v, sigma, epsilon, f_ext, a_form, model, output_base, debug,
-            constrained_rows=constrained_rows, applied=applied,
-        )
-        fields["solver_info"] = solver_info
-        extra = fields
-        log_fc_stage("fc_fields_rf", t0, stages)
-        _check_fc_force_balance(extra)
+    fields = _write_fc_linear_fields(
+        domain, uh, ctx.v, ctx.sigma, ctx.epsilon, f_ext, ctx.a_form, model, output_base, debug,
+        constrained_rows=constrained_rows, applied=applied, loads=step.loads, ctx=ctx,
+    )
+    fields["solver_info"] = solver_info
+    extra = fields
+    log_fc_stage("fc_fields_rf", t0, stages)
+    _check_fc_force_balance(extra)
+    try:
+        A.destroy()
+        b.destroy()
+        f_ext.destroy()
+    except Exception:
+        pass
 
     norma = np.linalg.norm(uh.x.array)
+    extra["u_max"] = float(np.max(np.linalg.norm(uh.x.array.reshape(-1, 3), axis=1))) if uh.x.array.size else 0.0
+    extra["analysis"] = "static"
     if debug:
         print(f"Norma: {norma:.6e}")
     return uh, extra
@@ -250,94 +299,112 @@ def run_linear_static_step(model, step, output_base: str, debug: int = 0, profil
 
 def run_from_inp(inp_path: str, output_dir: str = "/app/output", debug: int = 0,
                  profile: str = None, units: str = None, parse_only: bool = False,
-                 run_id: str = None, solver: str = "lu", rtol: float = 1e-10):
-    """Executa cada step e grava a saida somente em output_dir."""
+                 run_id: str = None, solver: str = "lu", rtol: float = 1e-10,
+                 restrictions=None, auto_lu_max_dofs=None):
+    """Executa cada passo e grava a saida somente em output_dir."""
     if not os.path.exists(inp_path):
         print(f"ERRO: arquivo nao encontrado: {inp_path}")
         sys.exit(1)
 
     profile_fc = (profile or "").strip().lower() == "fc"
     units_norm = None
-    if profile_fc:
-        if not units:
-            raise FCProfileError("Perfil FC exige --units (use mm-N-MPa-t-s).")
+    if profile_fc and not units:
+        raise FCProfileError("Perfil FC exige --units (use mm-N-MPa-t-s).")
+    if units:
         units_norm = normalize_units(units)
+    restrictions = restrictions or {}
 
     output_dir = prepare_output_dir(resolve_output_dir(output_dir))
     run_id = run_id or str(uuid.uuid4())
-    if profile_fc:
-        write_run_status(output_dir, {
-            "status": "started",
-            "run_id": run_id,
-            "solver_run": not parse_only,
-            "solver": normalize_solver(solver),
-            "rtol": normalize_rtol(rtol, normalize_solver(solver)),
-            "note": "run em andamento; manifesto antigo neste diretorio nao e sucesso desta run",
-        })
+    write_run_status(output_dir, {
+        "status": "started",
+        "run_id": run_id,
+        "solver_run": not parse_only,
+        "solver": normalize_solver(solver),
+        "rtol": normalize_rtol(rtol, normalize_solver(solver)),
+        "note": "run em andamento; manifesto antigo neste diretorio nao e sucesso desta run",
+    })
 
     model = parse_inp(inp_path, debug=debug, profile=profile)
+    validate_capabilities(model)
+    apply_restrictions(model, restrictions)
     if debug:
         print(summary(model))
         print("---")
 
     if parse_only:
         payload = parse_report_payload(model, os.path.abspath(inp_path))
+        payload["profile"] = profile or "generico"
         payload["run_id"] = run_id
         payload["units"] = units_norm
+        payload["restrictions"] = restrictions
         report_path = os.path.join(output_dir, "parse_report.json")
         with open(report_path, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2, ensure_ascii=False)
             handle.write("\n")
         print(PARSE_NOT_SOLVED_BANNER)
         print("Parse report:", report_path)
-        if profile_fc:
-            write_run_status(output_dir, {
-                "status": "parse_ok_not_solved",
-                "run_id": run_id,
-                "solver_run": False,
-                "parse_report": report_path,
-            })
+        write_run_status(output_dir, {
+            "status": "parse_ok_not_solved",
+            "run_id": run_id,
+            "solver_run": False,
+            "parse_report": report_path,
+        })
         return {"parse_only": True, "model": model, "report": payload}
 
-    if not model.steps:
-        model.steps.append(Step())
-
+    steps = effective_steps(model)
     results = []
-    for i, step in enumerate(model.steps):
+    ctx = None
+    for i, step in enumerate(steps):
         step_num = i + 1
         output_base = step_output_base(output_dir, inp_path, step_num)
-
         if debug:
             print(f"\n=== Step {step_num} ===")
-
-        kind = select_analysis(model, step)
-        if profile_fc and kind != "linear":
-            raise FCProfileError(
-                "Perfil FC aceita somente estatica linear (recebido: {0}).".format(kind)
+        if step.analysis_type == "heat":
+            from run_thermal import run_heat_steady
+            result, extra = run_heat_steady(
+                model, step, output_base, debug=debug, solver=solver, rtol=rtol,
+                auto_lu_max_dofs=auto_lu_max_dofs,
             )
-        if kind == "heat":
-            from run_thermal import run_thermal
-            result = run_thermal(inp_path, output_base, debug)
-            extra = {"honored": [], "artifacts": [], "reactions": None}
-        elif kind == "hyper":
-            from run_hyper import run_hyperelastic
-            result = run_hyperelastic(model, step, output_base, debug)
-            extra = {"honored": [], "artifacts": [], "reactions": None}
         else:
+            if ctx is None:
+                ctx = StaticContext(model, debug=debug, stages=[] if mem_profile_enabled() else None)
             result, extra = run_linear_static_step(
                 model, step, output_base, debug, profile=profile,
-                solver=solver, rtol=rtol,
+                solver=solver, rtol=rtol, ctx=ctx, auto_lu_max_dofs=auto_lu_max_dofs,
             )
+        extra["step"] = step_num
+        extra["output_base"] = os.path.basename(output_base)
         results.append((result, extra))
 
-    if profile_fc:
-        _finalize_fc_run(model, output_dir, inp_path, units_norm, results, debug, run_id=run_id)
-
+    _finalize_fc_run(model, output_dir, inp_path, units_norm, results, debug, run_id=run_id,
+                     profile=profile, restrictions=restrictions)
     return results
+
+def _cell_average_tensor(ctx, expr, name: str):
+    """Media do tensor na celula (DG0) com a mesma quadratura do CalculiX.
+
+    C3D8: Gauss 2x2x2; C3D10: 4 pontos. Para celula de jacobiano constante e a
+    media dos valores nos pontos de integracao (o que o *EL PRINT do ccx lista).
+    """
+    from dolfinx import fem
+    W = fem.functionspace(ctx.domain, ("DG", 0, (3, 3)))
+    w = ufl.TestFunction(W)
+    one = fem.functionspace(ctx.domain, ("DG", 0))
+    q = ufl.TestFunction(one)
+    md = {"quadrature_degree": 2}
+    num = assemble_vector(fem.form(ufl.inner(expr, w) * ufl.dx(metadata=md)))
+    vol = assemble_vector(fem.form(q * ufl.dx(metadata=md)))
+    func = fem.Function(W)
+    func.name = name
+    vals = np.asarray(num.array).reshape(-1, 9) / np.asarray(vol.array).reshape(-1, 1)
+    func.x.array[:] = vals.reshape(-1)
+    func.x.scatter_forward()
+    return func
 
 
 def _write_fc_linear_fields(domain, uh, v, sigma, epsilon, f_ext, a_form, model, output_base, debug,
-                            constrained_rows=None, applied=None):
+                            constrained_rows=None, applied=None, loads=None, ctx=None):
     """Grava U, S, principais, von Mises, E e RF do perfil FC. Falha se VTK falhar."""
     import json
     import os
@@ -354,8 +421,15 @@ def _write_fc_linear_fields(domain, uh, v, sigma, epsilon, f_ext, a_form, model,
     uh.name = "displacement"
     strain_ufl = epsilon(uh)
     cauchy_ufl = sigma(uh)
-    cauchy_f = interpolate_cell_tensor(domain, cauchy_ufl, "cauchy_stress")
-    strain_f = interpolate_cell_tensor(domain, strain_ufl, "strain")
+    if ctx is None or ctx.etype == "C3D4":
+        # C3D4 P1: tensao constante na celula; interpolacao DG0 exata.
+        cauchy_f = interpolate_cell_tensor(domain, cauchy_ufl, "cauchy_stress")
+        strain_f = interpolate_cell_tensor(domain, strain_ufl, "strain")
+        cell_location = "cell-DG0-constant-C3D4-P1"
+    else:
+        cauchy_f = _cell_average_tensor(ctx, cauchy_ufl, "cauchy_stress")
+        strain_f = _cell_average_tensor(ctx, strain_ufl, "strain")
+        cell_location = "cell-DG0-average-of-integration-points-{0}".format(ctx.etype)
     sigma_cells = tensor_array_from_function(cauchy_f)
     # Simetria residual ja e aplicada em principals_algebraic.
     principals, vm = principals_algebraic(sigma_cells)
@@ -397,7 +471,9 @@ def _write_fc_linear_fields(domain, uh, v, sigma, epsilon, f_ext, a_form, model,
     }
     # Momento das cargas aplicadas em torno da origem.
     mom_f = {"Mx": 0.0, "My": 0.0, "Mz": 0.0}
-    for cl in (model.steps[0].loads if model.steps else []):
+    if loads is None:
+        loads = model.steps[0].loads if model.steps else []
+    for cl in loads:
         if cl.node not in model.nodes:
             continue
         n = model.nodes[cl.node]
@@ -414,7 +490,7 @@ def _write_fc_linear_fields(domain, uh, v, sigma, epsilon, f_ext, a_form, model,
     }
     force_char = 0.0
     moment_char = 0.0
-    for cl in (model.steps[0].loads if model.steps else []):
+    for cl in loads:
         if cl.node not in model.nodes:
             continue
         n = model.nodes[cl.node]
@@ -463,10 +539,29 @@ def _write_fc_linear_fields(domain, uh, v, sigma, epsilon, f_ext, a_form, model,
         print("FC campos celula:", cell_pvd)
         print("FC RF:", totals, "R+F:", sum_rf, "free residual max:", rx["residual_free_dofs_max_abs"])
 
+    pressure = (applied or {}).get("pressure")
+    if pressure:
+        # Momento da pressao (somado como forcas nodais consistentes).
+        for key in ("Mx", "My", "Mz"):
+            mom_f[key] += pressure["M"][key]
+        mom_sum = {k: rx["moment_R_origin"][k] + mom_f[k] for k in ("Mx", "My", "Mz")}
+        force_char += pressure["force_char"]
+        moment_char += pressure["moment_char"]
+        payload["moment_F_origin"] = mom_f
+        payload["moment_R_plus_F_origin"] = mom_sum
+        payload["force_char"] = force_char
+        payload["moment_char"] = moment_char
+        payload["pressure"] = {k: pressure[k] for k in ("F", "n_faces")}
+        with open(react_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.write("\n")
+
+    degree = getattr(ctx, "degree", 1)
     honored = ["U", "S", "E", "PRINCIPAL", "VON_MISES", "RF"]
     artifacts = [
-        {"path": output_base + ".pvd", "field": "U", "location": "nodal-CG1", "space": "Lagrange-P1"},
-        {"path": cell_pvd, "field": "S,E,PRINCIPAL,VON_MISES", "location": "cell-DG0-constant-C3D4-P1",
+        {"path": output_base + ".pvd", "field": "U", "location": "nodal-CG{0}".format(degree),
+         "space": "Lagrange-P{0}".format(degree)},
+        {"path": cell_pvd, "field": "S,E,PRINCIPAL,VON_MISES", "location": cell_location,
          "tensor_order": "row-major XX,XY,XZ,YX,YY,YZ,ZX,ZY,ZZ",
          "principals": "algebraic sigma1>=sigma2>=sigma3 with sign; tensor symmetrized before eig",
          "note": "nodal smoothed does not replace cell field"},
@@ -548,27 +643,50 @@ def _stack_versions():
     return info
 
 
-def _finalize_fc_run(model, output_dir, inp_path, units_norm, results, debug, run_id=None):
+def _finalize_fc_run(model, output_dir, inp_path, units_norm, results, debug, run_id=None,
+                     profile=None, restrictions=None):
     rec = model.fc_record
-    honored = []
+    honored = None
     artifacts = []
     reactions = None
     solver_info = None
+    steps_info = []
     for _res, extra in results:
-        honored = list(extra.get("honored") or [])
+        h = list(extra.get("honored") or [])
+        honored = h if honored is None else [f for f in honored if f in h]
         artifacts.extend(extra.get("artifacts") or [])
         reactions = extra.get("reactions") or reactions
         solver_info = extra.get("solver_info") or solver_info
+        rx = extra.get("reactions") or {}
+        steps_info.append({
+            "step": extra.get("step"),
+            "analysis": extra.get("analysis"),
+            "output_base": extra.get("output_base"),
+            "honored": h,
+            "u_max": extra.get("u_max"),
+            "t_min": extra.get("t_min"),
+            "t_max": extra.get("t_max"),
+            "reaction_totals": rx.get("totals"),
+            "applied_totals": rx.get("applied_totals"),
+            "solver": extra.get("solver_info"),
+        })
+    honored = honored or []
 
-    requested = required_output_fields(rec) if rec else ["U", "S", "PRINCIPAL", "VON_MISES"]
+    analysis = {s.get("analysis") for s in steps_info}
+    if analysis == {"heat"}:
+        requested = ["NT"] + [f for r in (rec.requests if rec else []) for f in r.fields if f not in ("NT",)]
+    else:
+        requested = required_output_fields(rec) if rec else ["U", "S", "PRINCIPAL", "VON_MISES"]
     check_honored_outputs(requested, honored)
 
     payload = {
         "status": "ok",
         "run_id": run_id,
         "solver_run": True,
-        "profile": "fc",
-        "units": units_norm,
+        "profile": profile or "generico",
+        "restrictions": restrictions or {},
+        "units": units_norm if units_norm else "nao declaradas (--units ausente); valores nas unidades do deck",
+        "steps": steps_info,
         "inp": os.path.abspath(inp_path),
         "start_time": 0.0,
         "n_steps": len(model.steps),
@@ -581,7 +699,8 @@ def _finalize_fc_run(model, output_dir, inp_path, units_norm, results, debug, ru
         "ignored_cards": [
             {"keyword": it.keyword, "reason": it.reason, "line": it.line, "detail": it.detail}
             for it in (rec.ignored if rec else [])
-        ],
+        ] + [it for it in ignored_items(model)
+             if not any(x.line == it["line"] for x in (rec.ignored if rec else []))],
         "output_requests": [
             {"kind": r.kind, "fields": r.fields, "nset": r.nset, "totals_only": r.totals_only, "line": r.line}
             for r in (rec.requests if rec else [])
@@ -656,10 +775,12 @@ if __name__ == "__main__":
             run_id=run_id,
             solver=args.solver,
             rtol=args.rtol,
+            restrictions=args.restrictions,
+            auto_lu_max_dofs=args.auto_lu_max_dofs,
         )
     except FCProfileError as exc:
-        print("ERRO FC: {0}".format(exc))
-        if profile_fc:
+        print("ERRO INP: {0}".format(exc))
+        if True:
             try:
                 write_run_status(prepare_output_dir(output_dir), {
                     "status": "failed",
@@ -674,7 +795,7 @@ if __name__ == "__main__":
         sys.exit(2)
     except RuntimeError as exc:
         print("ERRO: {0}".format(exc))
-        if profile_fc:
+        if True:
             try:
                 failed = {
                     "status": "failed",
@@ -694,7 +815,7 @@ if __name__ == "__main__":
         sys.exit(3)
     except Exception as exc:
         print("ERRO: {0}: {1}".format(type(exc).__name__, exc))
-        if profile_fc:
+        if True:
             try:
                 write_run_status(prepare_output_dir(output_dir), {
                     "status": "failed",

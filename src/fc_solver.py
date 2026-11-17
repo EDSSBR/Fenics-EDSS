@@ -192,10 +192,11 @@ def _true_residual_convergence_test(ksp, rtol: float, max_it: int):
     return work
 
 
-def _configure_cg_gamg(ksp, A, V, rtol: float, max_it: int) -> None:
+def _configure_cg_gamg(ksp, A, V, rtol: float, max_it: int, near_nullspace: str = "elastic") -> None:
     from petsc4py import PETSc
 
-    refs = build_elastic_near_nullspace(V, A)
+    # Escalar (termico): sem near-nullspace elastico; GAMG usa o modo constante padrao.
+    refs = build_elastic_near_nullspace(V, A) if near_nullspace == "elastic" else None
     ksp.setOperators(A)
     ksp.setType(PETSc.KSP.Type.CG)
     ksp.setTolerances(rtol=rtol, atol=0.0, divtol=1e5, max_it=int(max_it))
@@ -227,7 +228,8 @@ def _configure_cg_gamg(ksp, A, V, rtol: float, max_it: int) -> None:
 
 
 def solve_linear(A, b, uh, V, *, solver: str = SOLVER_LU, rtol: float = DEFAULT_RTOL,
-                 max_it: int = DEFAULT_MAX_IT, debug: int = 0) -> Dict[str, Any]:
+                 max_it: int = DEFAULT_MAX_IT, debug: int = 0,
+                 near_nullspace: str = "elastic") -> Dict[str, Any]:
     """Resolve A u = b. LU padrao; cg-gamg opt-in. Sem fallback."""
     from petsc4py import PETSc
 
@@ -254,7 +256,7 @@ def solve_linear(A, b, uh, V, *, solver: str = SOLVER_LU, rtol: float = DEFAULT_
         # rtol interno mais apertado no KSP (rnorm recursivo). O criterio
         # oficial e ||Au-b||/||b|| <= rtol, via buildResidual + A.mult.
         internal_rtol = min(rtol * 0.1, 1e-12)
-        ns_refs = _configure_cg_gamg(ksp, A, V, internal_rtol, max_it)
+        ns_refs = _configure_cg_gamg(ksp, A, V, internal_rtol, max_it, near_nullspace=near_nullspace)
         ksp.setMonitor(_monitor)
         # Nao usa setConvergenceTest: um teste com residual mal avaliado
         # no callback ja falhou (nao parava). O KSP para no rnorm recursivo
@@ -334,7 +336,8 @@ def solve_linear(A, b, uh, V, *, solver: str = SOLVER_LU, rtol: float = DEFAULT_
         "residual_norm": rn,
         "rhs_norm": bn,
         "true_residual_rel": rel,
-        "near_nullspace": "elastic-6-rbm" if kind == SOLVER_CG_GAMG else None,
+        "near_nullspace": ("elastic-6-rbm" if near_nullspace == "elastic" else "gamg-default")
+        if kind == SOLVER_CG_GAMG else None,
         "history_len": len(history),
         "history_tail": history[-5:],
     }

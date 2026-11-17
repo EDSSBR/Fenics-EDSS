@@ -336,7 +336,7 @@ def apply_cloads(V, b, model, step, profile_fc: bool) -> Dict[str, float]:
     return applied
 
 
-def collect_constrained_dofs(V, model, profile_fc: bool):
+def collect_constrained_dofs(V, model, profile_fc: bool, boundary=None):
     """Lista (inp_node, component, parent_dof) apenas dos DOFs prescritos.
 
     Um Function + dirichletbc por (componente, valor), nunca por no. O valor
@@ -350,7 +350,7 @@ def collect_constrained_dofs(V, model, profile_fc: bool):
     last_value = {}
     last_pair = {}
     locator = component_dof_locator(V)
-    for bc in model.boundary:
+    for bc in (model.boundary if boundary is None else boundary):
         if bc.node not in model.nodes:
             if profile_fc:
                 raise FCProfileError("BOUNDARY referencia no inexistente: {0}".format(bc.node))
