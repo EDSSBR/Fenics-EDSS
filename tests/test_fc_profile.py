@@ -143,9 +143,11 @@ def test_fc_aceita_el_print(tmp_path):
     assert req.elset == "Eall"
 
 
-def test_perfil_default_ainda_aceita_heat_e_type_default(tmp_path):
-    model = parse_inp(_w(tmp_path, "def.inp", "*ELEMENT\n1, 1, 2, 3, 4, 5, 6, 7, 8\n*STEP\n*HEAT TRANSFER\n*END STEP\n"))
-    assert next(iter(model.elements.values())).type == "C3D8"
+def test_element_sem_type_e_erro_sem_default_c3d8(tmp_path):
+    # Decisao Valdir 17/11/2026: sem fallback silencioso; o CalculiX exige TYPE.
+    with pytest.raises(FCProfileError, match="sem TYPE"):
+        parse_inp(_w(tmp_path, "def.inp", "*ELEMENT\n1, 1, 2, 3, 4, 5, 6, 7, 8\n*STEP\n*HEAT TRANSFER\n*END STEP\n"))
+    model = parse_inp(_w(tmp_path, "heat.inp", "*ELEMENT, TYPE=C3D8\n1, 1, 2, 3, 4, 5, 6, 7, 8\n*STEP\n*HEAT TRANSFER, STEADY STATE\n*END STEP\n"))
     assert model.analysis_type == "heat"
 
 

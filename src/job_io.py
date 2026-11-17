@@ -22,15 +22,17 @@ DEFAULT_OUTPUT_DIR = "/app/output"
 USAGE = (
     "Uso: python3 run_from_inp.py arquivo.inp "
     "[--output-dir DIR | -output DIR] [--profile fc] "
-    "[--units mm-N-MPa-t-s] [--solver lu|cg-gamg] [--rtol 1e-10] "
-    "[--parse-only] [-debug=1]\n"
+    "[--units mm-N-MPa-t-s] [--solver lu|cg-gamg|auto] [--auto-lu-max-dofs N] "
+    "[--rtol 1e-10] [--restrictions JSON] [--parse-only] [-debug=1]\n"
     "  arquivo.inp            caminho do .inp deste job\n"
     "  --output-dir, -output  diretorio de saida deste job "
     f"(padrao: {DEFAULT_OUTPUT_DIR})\n"
-    "  --profile fc           whitelist fechada e contrato de saidas FC\n"
-    "  --units                obrigatorio com --profile fc (mm-N-MPa-t-s)\n"
-    "  --solver               lu (padrao) ou cg-gamg (CG + PETSc GAMG); "
+    "  --profile fc           restricoes do perfil FC (C3D4, um passo, sem DLOAD)\n"
+    "  --units                sistema de unidades do deck (obrigatorio com --profile fc)\n"
+    "  --solver               lu (padrao), cg-gamg (CG + PETSc GAMG) ou auto; "
     "sem fallback\n"
+    "  --auto-lu-max-dofs N   com --solver auto: n_dofs < N usa lu, senao cg-gamg\n"
+    "  --restrictions JSON    restricoes da configuracao: element_types, max_steps, blocked_keywords\n"
     "  --rtol                 tolerancia relativa do KSP (so cg-gamg, "
     "obrigatorio <= 1e-10; padrao 1e-10)\n"
     "  --parse-only           valida o parse e para; NAO executa o solver\n"
@@ -56,6 +58,8 @@ class RunArgs:
         parse_only: bool = False,
         solver: str = "lu",
         rtol: float = 1e-10,
+        restrictions: Optional[Dict[str, Any]] = None,
+        auto_lu_max_dofs: Optional[int] = None,
     ):
         self.inp_file = inp_file
         self.output_dir = output_dir
@@ -65,6 +69,8 @@ class RunArgs:
         self.parse_only = parse_only
         self.solver = solver
         self.rtol = rtol
+        self.restrictions = restrictions or {}
+        self.auto_lu_max_dofs = auto_lu_max_dofs
 
     def __iter__(self):
         yield self.inp_file
@@ -76,12 +82,15 @@ class RunArgs:
 
 
 
+SOLVER_AUTO = "auto"
+
+
 def normalize_solver(name: Optional[str]) -> str:
     raw = (name or "lu").strip().lower()
     if raw in ("", "direct", "preonly-lu"):
         raw = "lu"
-    if raw not in ("lu", "cg-gamg"):
-        raise ValueError("solver desconhecido: {0} (use lu ou cg-gamg)".format(name))
+    if raw not in ("lu", "cg-gamg", SOLVER_AUTO):
+        raise ValueError("solver desconhecido: {0} (use lu, cg-gamg ou auto)".format(name))
     return raw
 
 
@@ -95,7 +104,7 @@ def normalize_rtol(rtol, solver: str) -> float:
             raise ValueError("rtol invalido: {0}".format(rtol)) from exc
     if val != val or val in (float("inf"), float("-inf")) or val <= 0:
         raise ValueError("rtol deve ser positivo e finito (recebido {0})".format(rtol))
-    if solver == "cg-gamg" and val > 1e-10:
+    if solver in ("cg-gamg", SOLVER_AUTO) and val > 1e-10:
         raise ValueError("CG+GAMG exige rtol <= 1e-10 (recebido {0:g})".format(val))
     return val
 
@@ -114,6 +123,8 @@ def parse_run_args(argv: Sequence[str]) -> RunArgs:
     parse_only = False
     solver: Optional[str] = None
     rtol_raw: Optional[str] = None
+    restrictions_raw: Optional[str] = None
+    auto_raw: Optional[str] = None
     args: List[str] = list(argv)
     i = 0
     while i < len(args):
@@ -166,6 +177,18 @@ def parse_run_args(argv: Sequence[str]) -> RunArgs:
             rtol_raw = args[i]
         elif arg.startswith("--rtol="):
             rtol_raw = arg.split("=", 1)[1]
+        elif arg in ("--restrictions", "--auto-lu-max-dofs"):
+            i += 1
+            if i >= len(args):
+                raise ValueError("faltou o valor de {0}".format(arg))
+            if arg == "--restrictions":
+                restrictions_raw = args[i]
+            else:
+                auto_raw = args[i]
+        elif arg.startswith("--restrictions="):
+            restrictions_raw = arg.split("=", 1)[1]
+        elif arg.startswith("--auto-lu-max-dofs="):
+            auto_raw = arg.split("=", 1)[1]
         elif arg.startswith("-"):
             raise ValueError(f"opcao desconhecida: {arg}")
         else:
@@ -181,9 +204,24 @@ def parse_run_args(argv: Sequence[str]) -> RunArgs:
             raise ValueError("perfil desconhecido: {0} (use fc)".format(profile))
     solver_norm = normalize_solver(solver)
     rtol_norm = normalize_rtol(rtol_raw, solver_norm)
+    from inp_capabilities import parse_restrictions
+    restrictions = parse_restrictions(restrictions_raw)
+    auto_lu_max_dofs = None
+    if auto_raw is not None:
+        try:
+            auto_lu_max_dofs = int(auto_raw)
+        except ValueError as exc:
+            raise ValueError("--auto-lu-max-dofs deve ser inteiro: {0}".format(auto_raw)) from exc
+        if auto_lu_max_dofs < 1:
+            raise ValueError("--auto-lu-max-dofs deve ser >= 1")
+        if solver_norm != SOLVER_AUTO:
+            raise ValueError("--auto-lu-max-dofs so vale com --solver auto")
+    if solver_norm == SOLVER_AUTO and auto_lu_max_dofs is None:
+        raise ValueError("--solver auto exige --auto-lu-max-dofs (limite definido na configuracao)")
     return RunArgs(
         inp_file, output_dir, debug, profile=profile, units=units,
         parse_only=parse_only, solver=solver_norm, rtol=rtol_norm,
+        restrictions=restrictions, auto_lu_max_dofs=auto_lu_max_dofs,
     )
 
 

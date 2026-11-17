@@ -2,8 +2,15 @@
 """
 Parser minimo de arquivo .inp (CalculiX/Abaqus) para FeniCS-EDSS.
 
-Fora do perfil FC o recorte anterior e preservado (C3D8/C3D4, hiperelastico,
-termico, etc.). No perfil FC (--profile fc) a whitelist e fechada: ver fc_profile.py.
+Um unico caminho para qualquer .inp do CalculiX. O que o FenicsEDSS ainda
+nao implementa e recusado com erro explicito (inp_capabilities.py); o
+perfil FC (--profile fc) e so um conjunto extra de restricoes (fc_profile.py).
+Semantica de passos igual a do CalculiX 2.23 (medida em 17/11/2026):
+- *CLOAD repetido no mesmo no/dof dentro de um passo soma;
+- num passo novo, o valor do no/dof informado substitui o anterior e os
+  demais continuam ativos; OP=NEW remove todas as cargas anteriores;
+- *BOUNDARY antes do primeiro *STEP vale para todos os passos; dentro de um
+  passo, acrescenta/substitui; OP=NEW remove as condicoes anteriores.
 """
 
 import re
@@ -50,6 +57,8 @@ class Material:
     mu: Optional[float] = None
     lmbda: Optional[float] = None
     hyperelastic: bool = False
+    has_elastic: bool = False
+    has_conductivity: bool = False
 
 
 @dataclass
@@ -77,6 +86,12 @@ class SurfaceLoad:
 class Step:
     loads: List[ConcentratedLoad] = field(default_factory=list)
     dloads: List[SurfaceLoad] = field(default_factory=list)
+    boundary: List[BoundaryCondition] = field(default_factory=list)
+    boundary_op_new: bool = False
+    cload_op_new: bool = False
+    dload_op_new: bool = False
+    heat_steady: bool = False
+    line: int = 0
     nlgeom: bool = False
     analysis_type: str = "static"
     static_increments: Optional[List[float]] = None
@@ -99,6 +114,8 @@ class INPModel:
     hyperelastic: bool = False
     fc_record: Optional[FCParseRecord] = None
     element_nset_from_node_card: Optional[str] = None
+    # *BOUNDARY antes do primeiro *STEP (vale para todos os passos).
+    initial_boundary: List[BoundaryCondition] = field(default_factory=list)
 
 
 
@@ -129,6 +146,82 @@ def _resolve_set_aliases(sets, aliases):
             pending[name] = still
         if not progressed:
             break
+
+
+# Numero de nos por tipo de elemento (para ler linhas de continuacao).
+NODES_PER_ELEMENT = {
+    "C3D4": 4, "C3D6": 6, "C3D8": 8, "C3D8R": 8, "C3D8I": 8,
+    "C3D10": 10, "C3D10T": 10, "C3D15": 15, "C3D20": 20, "C3D20R": 20,
+}
+
+
+def _op_new(line: str) -> bool:
+    m = re.search(r"\bOP\s*=\s*(\w+)", line, flags=re.IGNORECASE)
+    if not m:
+        return False
+    op = m.group(1).upper()
+    if op not in ("NEW", "MOD"):
+        raise FCProfileError("Parametro OP={0} invalido em: {1}".format(m.group(1), line.strip()))
+    return op == "NEW"
+
+
+def _set_targets(model, target: str, lineno: int, card: str) -> List[int]:
+    """No (numero) ou nome de NSET -> lista de nos. NSET inexistente e erro."""
+    if target.lstrip("+-").isdigit():
+        return [int(target)]
+    for nset_name, nodes in model.nsets.items():
+        if nset_name.upper() == target.upper():
+            return list(nodes)
+    raise FCProfileError(
+        "L{0}: *{1} referencia NSET inexistente: {2!r}".format(lineno, card, target)
+    )
+
+
+def _lookup_set(sets, ref: str, owner: str, lineno: int, card: str) -> List[int]:
+    """Conteudo de um set ja definido, referenciado por nome dentro de outro set."""
+    for key, vals in sets.items():
+        if key.upper() == ref.upper():
+            if key.upper() == owner.upper():
+                raise FCProfileError("L{0}: *{1} {2} referencia a si mesmo".format(lineno, card, owner))
+            return list(vals)
+    raise FCProfileError(
+        "L{0}: *{1} {2} referencia {3!r}, que nao e numero nem {1} definido antes".format(
+            lineno, card, owner, ref
+        )
+    )
+
+
+def _read_set_block(lines, i, generate):
+    """Le os dados de *NSET/*ELSET. Devolve (ids, aliases, i)."""
+    ids: List[int] = []
+    aliases: List[str] = []
+    while i < len(lines) and not _is_keyword_line(lines[i]):
+        raw = lines[i].strip()
+        if not raw or raw.startswith("**"):
+            i += 1
+            continue
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        if generate:
+            try:
+                nums = [int(p) for p in parts]
+            except ValueError as exc:
+                raise FCProfileError(
+                    "L{0}: GENERATE espera inicio, fim[, passo]: {1}".format(i + 1, raw)
+                ) from exc
+            if len(nums) not in (2, 3) or (len(nums) == 3 and nums[2] <= 0):
+                raise FCProfileError(
+                    "L{0}: GENERATE espera inicio, fim[, passo]: {1}".format(i + 1, raw)
+                )
+            step = nums[2] if len(nums) == 3 else 1
+            ids.extend(range(nums[0], nums[1] + 1, step))
+        else:
+            for tok in parts:
+                try:
+                    ids.append(int(tok))
+                except ValueError:
+                    aliases.append(tok)
+        i += 1
+    return ids, aliases, i
 
 
 def parse_inp(path: str, debug: int = 0, profile: Optional[str] = None) -> INPModel:
@@ -179,25 +272,41 @@ def parse_inp(path: str, debug: int = 0, profile: Optional[str] = None) -> INPMo
         if key == "ELEMENT":
             match = re.search(r"TYPE\s*=\s*(\w+)", line, flags=re.IGNORECASE)
             if match:
-                etype = match.group(1)
-            elif profile_fc:
-                raise FCProfileError(
-                    "L{0}: *ELEMENT sem TYPE e rejeitado no perfil FC (sem default C3D8).".format(lineno)
-                )
+                etype = match.group(1).upper()
             else:
-                etype = "C3D8"
+                raise FCProfileError(
+                    "L{0}: *ELEMENT sem TYPE (o CalculiX exige TYPE; sem default C3D8).".format(lineno)
+                )
             elset_m = re.search(r"ELSET\s*=\s*(\w+)", line, flags=re.IGNORECASE)
             elset_name = elset_m.group(1) if elset_m else None
+            npe = NODES_PER_ELEMENT.get(etype)
             i += 1
+            pending: List[int] = []
             while i < len(lines) and not _is_keyword_line(lines[i]):
-                parts = [p.strip() for p in lines[i].split(",") if p.strip()]
-                if len(parts) >= 2 and not lines[i].strip().startswith("**"):
-                    eid = int(parts[0])
-                    nodes = [int(n) for n in parts[1:]]
-                    model.elements[eid] = Element(eid, etype, nodes)
-                    if elset_name:
-                        model.elsets.setdefault(elset_name, []).append(eid)
+                raw = lines[i].strip()
+                if raw and not raw.startswith("**"):
+                    pending.extend(int(p) for p in raw.split(",") if p.strip())
+                    # Elemento completo: npe nos + id (ou linha unica se tipo desconhecido).
+                    if npe is None or len(pending) >= npe + 1:
+                        if npe is not None and len(pending) != npe + 1:
+                            raise FCProfileError(
+                                "L{0}: elemento {1} {2} com {3} nos (esperado {4}).".format(
+                                    i + 1, pending[0], etype, len(pending) - 1, npe
+                                )
+                            )
+                        if len(pending) >= 2:
+                            eid = pending[0]
+                            model.elements[eid] = Element(eid, etype, pending[1:])
+                            if elset_name:
+                                model.elsets.setdefault(elset_name, []).append(eid)
+                        pending = []
                 i += 1
+            if pending:
+                raise FCProfileError(
+                    "L{0}: elemento {1} {2} incompleto ({3} nos).".format(
+                        lineno, pending[0], etype, len(pending) - 1
+                    )
+                )
             continue
 
         if key == "MATERIAL":
@@ -217,6 +326,7 @@ def parse_inp(path: str, debug: int = 0, profile: Optional[str] = None) -> INPMo
                     if len(parts) >= 2:
                         model.materials[current_material].E = float(parts[0])
                         model.materials[current_material].nu = float(parts[1])
+                        model.materials[current_material].has_elastic = True
                     i += 1
                     break
                 i += 1
@@ -248,6 +358,7 @@ def parse_inp(path: str, debug: int = 0, profile: Optional[str] = None) -> INPMo
                     parts = [p.strip() for p in s.split(",")]
                     if parts:
                         model.materials[current_material].k = float(parts[0])
+                        model.materials[current_material].has_conductivity = True
                     i += 1
                     break
                 i += 1
@@ -266,17 +377,10 @@ def parse_inp(path: str, debug: int = 0, profile: Optional[str] = None) -> INPMo
             if match:
                 nset_name = match.group(1)
                 model.nsets.setdefault(nset_name, [])
-                i += 1
-                while i < len(lines) and not _is_keyword_line(lines[i]):
-                    parts = [p.strip() for p in lines[i].split(",") if p.strip()]
-                    for tok in parts:
-                        if tok.startswith("**"):
-                            continue
-                        try:
-                            model.nsets[nset_name].append(int(tok))
-                        except ValueError:
-                            nset_aliases.setdefault(nset_name, []).append(tok)
-                    i += 1
+                ids, al, i = _read_set_block(lines, i + 1, "GENERATE" in upper)
+                model.nsets[nset_name].extend(ids)
+                for ref in al:
+                    model.nsets[nset_name].extend(_lookup_set(model.nsets, ref, nset_name, lineno, "NSET"))
                 continue
             i += 1
             continue
@@ -286,36 +390,34 @@ def parse_inp(path: str, debug: int = 0, profile: Optional[str] = None) -> INPMo
             if match:
                 elset_name = match.group(1)
                 model.elsets.setdefault(elset_name, [])
-                i += 1
-                while i < len(lines) and not _is_keyword_line(lines[i]):
-                    parts = [p.strip() for p in lines[i].split(",") if p.strip()]
-                    for tok in parts:
-                        if tok.startswith("**"):
-                            continue
-                        try:
-                            model.elsets[elset_name].append(int(tok))
-                        except ValueError:
-                            elset_aliases.setdefault(elset_name, []).append(tok)
-                    i += 1
+                ids, al, i = _read_set_block(lines, i + 1, "GENERATE" in upper)
+                model.elsets[elset_name].extend(ids)
+                for ref in al:
+                    model.elsets[elset_name].extend(_lookup_set(model.elsets, ref, elset_name, lineno, "ELSET"))
                 continue
             i += 1
             continue
 
         if key == "DLOAD":
+            if current_step is None:
+                raise FCProfileError(
+                    "L{0}: *DLOAD fora de *STEP (o CalculiX exige cargas dentro do passo).".format(lineno)
+                )
+            if _op_new(line):
+                current_step.dload_op_new = True
             i += 1
             while i < len(lines) and not _is_keyword_line(lines[i]):
                 parts = [p.strip() for p in lines[i].split(",")]
                 if len(parts) >= 3 and not lines[i].strip().startswith("**"):
                     elset = parts[0]
-                    face = parts[1]
-                    value = float(parts[2])
-                    dl = SurfaceLoad(elset, face, value)
-                    if current_step:
-                        current_step.dloads.append(dl)
-                    else:
-                        if not model.steps:
-                            model.steps.append(Step())
-                        model.steps[0].dloads.append(dl)
+                    face = parts[1].upper()
+                    try:
+                        value = float(parts[2])
+                    except ValueError as exc:
+                        raise FCProfileError(
+                            "L{0}: *DLOAD com valor invalido: {1}".format(i + 1, lines[i].strip())
+                        ) from exc
+                    current_step.dloads.append(SurfaceLoad(elset, face, value))
                 i += 1
             continue
 
@@ -325,6 +427,9 @@ def parse_inp(path: str, debug: int = 0, profile: Optional[str] = None) -> INPMo
             continue
 
         if key == "BOUNDARY":
+            bc_target_list = current_step.boundary if current_step is not None else model.initial_boundary
+            if current_step is not None and _op_new(line):
+                current_step.boundary_op_new = True
             i += 1
             while i < len(lines) and not _is_keyword_line(lines[i]):
                 raw_parts = [p.strip() for p in lines[i].split(",")]
@@ -333,14 +438,14 @@ def parse_inp(path: str, debug: int = 0, profile: Optional[str] = None) -> INPMo
                 parts = raw_parts
                 if len(parts) >= 2 and not lines[i].strip().startswith("**"):
                     target = parts[0]
-                    if profile_fc and len(parts) == 3 and parts[2] != "":
+                    if len(parts) == 3 and parts[2] != "":
                         third = parts[2]
                         looks_value = ("." in third) or ("e" in third.lower()) or (
                             third.lstrip("+-").isdigit() and int(third) not in range(1, 7)
                         )
                         if looks_value:
                             raise FCProfileError(
-                                "L{0}: *BOUNDARY com 3 colunas e ambiguo no perfil FC. "
+                                "L{0}: *BOUNDARY com 3 colunas e ambiguo. "
                                 "CalculiX usa no, dof_ini, dof_fim[, valor]. "
                                 "Use 2 colunas (valor 0) ou 4 colunas (no, ini, fim, valor). "
                                 "Linha: {1}".format(i + 1, lines[i].strip())
@@ -359,22 +464,18 @@ def parse_inp(path: str, debug: int = 0, profile: Optional[str] = None) -> INPMo
                                 i + 1, exc, lines[i].strip()
                             )
                         ) from exc
-                    nodes_to_apply = []
-                    if target.isdigit():
-                        nodes_to_apply = [int(target)]
-                    else:
-                        for nset_name, nodes in model.nsets.items():
-                            if nset_name.upper() == target.upper():
-                                nodes_to_apply = nodes
-                                break
+                    nodes_to_apply = _set_targets(model, target, i + 1, "BOUNDARY")
                     for nid in nodes_to_apply:
                         for dof in range(dof_start, dof_end + 1):
-                            model.boundary.append(BoundaryCondition(nid, dof, value))
+                            bc = BoundaryCondition(nid, dof, value)
+                            model.boundary.append(bc)
+                            bc_target_list.append(bc)
                 i += 1
             continue
 
         if key == "STEP":
             current_step = Step()
+            current_step.line = lineno
             current_step.step_params = keyword_params(line)
             current_step.start_time = 0.0
             for param in current_step.step_params:
@@ -427,24 +528,30 @@ def parse_inp(path: str, debug: int = 0, profile: Optional[str] = None) -> INPMo
             model.analysis_type = "heat"
             if current_step:
                 current_step.analysis_type = "heat"
+                current_step.heat_steady = "STEADY" in upper.replace(" ", "")
             i += 1
             continue
 
         if key == "CLOAD":
+            if current_step is None:
+                raise FCProfileError(
+                    "L{0}: *CLOAD fora de *STEP (o CalculiX exige cargas dentro do passo).".format(lineno)
+                )
+            if _op_new(line):
+                current_step.cload_op_new = True
             i += 1
             while i < len(lines) and not _is_keyword_line(lines[i]):
                 parts = [p.strip() for p in lines[i].split(",")]
                 if len(parts) >= 3 and not lines[i].strip().startswith("**"):
-                    node = int(parts[0])
-                    dof = int(parts[1])
-                    value = float(parts[2])
-                    cl = ConcentratedLoad(node, dof, value)
-                    if current_step:
-                        current_step.loads.append(cl)
-                    else:
-                        if not model.steps:
-                            model.steps.append(Step())
-                        model.steps[0].loads.append(cl)
+                    try:
+                        dof = int(parts[1])
+                        value = float(parts[2])
+                    except ValueError as exc:
+                        raise FCProfileError(
+                            "L{0}: *CLOAD invalido (no|NSET, dof, valor): {1}".format(i + 1, lines[i].strip())
+                        ) from exc
+                    for node in _set_targets(model, parts[0], i + 1, "CLOAD"):
+                        current_step.loads.append(ConcentratedLoad(node, dof, value))
                 i += 1
             continue
 
@@ -615,6 +722,104 @@ def get_material_for_element(model: INPModel, elem_id: int) -> Optional[Material
     if model.materials:
         return next(iter(model.materials.values()))
     return None
+
+
+def materials_by_element_strict(model: INPModel, need: str) -> Dict[int, Material]:
+    """eid -> Material via *SOLID SECTION, sem fallback. ``need``: 'elastic' ou 'conductivity'.
+
+    Erros (como o CalculiX): secao com ELSET ou MATERIAL inexistente, elemento
+    sem secao, elemento em duas secoes, material sem a propriedade pedida.
+    """
+    errors: List[str] = []
+    elsets = {name.upper(): ids for name, ids in model.elsets.items()}
+    mats = {name.upper(): mat for name, mat in model.materials.items()}
+    mapping: Dict[int, Material] = {}
+    for sname, mname in model.solid_sections.items():
+        ids = elsets.get(sname.upper())
+        mat = mats.get(mname.upper())
+        if ids is None:
+            errors.append("*SOLID SECTION com ELSET inexistente: {0}".format(sname))
+            continue
+        if mat is None:
+            errors.append("*SOLID SECTION {0} com MATERIAL inexistente: {1}".format(sname, mname))
+            continue
+        for eid in ids:
+            eid = int(eid)
+            prev = mapping.get(eid)
+            if prev is not None and prev is not mat:
+                errors.append("Elemento {0} em duas *SOLID SECTION ({1} e {2})".format(eid, prev.name, mat.name))
+                if len(errors) > 20:
+                    break
+            mapping[eid] = mat
+    missing = [eid for eid in model.elements if eid not in mapping]
+    if missing:
+        errors.append("{0} elemento(s) sem *SOLID SECTION (ex.: {1}); sem material padrao".format(
+            len(missing), missing[:5]))
+    used = {id(m): m for m in mapping.values()}.values()
+    for mat in used:
+        if need == "elastic":
+            if not mat.has_elastic:
+                errors.append("Material {0} sem *ELASTIC".format(mat.name))
+            elif not (mat.E > 0) or not (-1.0 < mat.nu < 0.5):
+                errors.append("Material {0} com *ELASTIC invalido (E={1}, nu={2})".format(mat.name, mat.E, mat.nu))
+        elif need == "conductivity":
+            if not mat.has_conductivity:
+                errors.append("Material {0} sem *CONDUCTIVITY".format(mat.name))
+            elif not (mat.k > 0):
+                errors.append("Material {0} com *CONDUCTIVITY invalida ({1})".format(mat.name, mat.k))
+    if errors:
+        raise FCProfileError("Materiais/secoes invalidos:\n- " + "\n- ".join(errors[:25]))
+    return mapping
+
+
+def effective_steps(model: INPModel) -> List[Step]:
+    """Estado de cargas e condicoes de contorno ativo em cada passo (semantica CalculiX).
+
+    Medido no ccx 2.23 (17/11/2026): dentro de um passo, *CLOAD repetido no mesmo
+    no/dof soma; num passo novo, o no/dof informado substitui o valor anterior e os
+    outros continuam; OP=NEW zera as cargas anteriores. *BOUNDARY: ultimo valor
+    vence; OP=NEW remove as condicoes anteriores (inclusive as do modelo).
+    *DLOAD segue a regra do *CLOAD, por (elemento/ELSET, face).
+    """
+    out: List[Step] = []
+    bc_state: Dict[Tuple[int, int], float] = {}
+    for bc in model.initial_boundary:
+        bc_state[(bc.node, bc.dof)] = bc.value
+    cl_state: Dict[Tuple[int, int], float] = {}
+    dl_state: Dict[Tuple[str, str], float] = {}
+    for step in model.steps:
+        if step.boundary_op_new:
+            bc_state = {}
+        for bc in step.boundary:
+            bc_state[(bc.node, bc.dof)] = bc.value
+        if step.cload_op_new:
+            cl_state = {}
+        this_cl: Dict[Tuple[int, int], float] = {}
+        for cl in step.loads:
+            key = (cl.node, cl.dof)
+            this_cl[key] = this_cl.get(key, 0.0) + cl.value
+        cl_state.update(this_cl)
+        if step.dload_op_new:
+            dl_state = {}
+        this_dl: Dict[Tuple[str, str], float] = {}
+        for dl in step.dloads:
+            key = (dl.elset, dl.face)
+            this_dl[key] = this_dl.get(key, 0.0) + dl.value
+        dl_state.update(this_dl)
+        eff = Step(
+            loads=[ConcentratedLoad(n, d, v) for (n, d), v in cl_state.items()],
+            dloads=[SurfaceLoad(e, f, v) for (e, f), v in dl_state.items()],
+            boundary=[BoundaryCondition(n, d, v) for (n, d), v in bc_state.items()],
+            nlgeom=step.nlgeom,
+            analysis_type=step.analysis_type,
+            static_increments=step.static_increments,
+            step_params=list(step.step_params),
+            start_time=step.start_time,
+            heat_steady=step.heat_steady,
+            line=step.line,
+        )
+        out.append(eff)
+    return out
 
 
 def summary(model: INPModel) -> str:
