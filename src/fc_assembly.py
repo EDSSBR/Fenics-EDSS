@@ -486,6 +486,39 @@ def residual_on_constrained(
     }
 
 
+NODE_PRINT_RF_DEFINITION = (
+    "Como o *NODE PRINT, TOTALS=YES do CalculiX: soma da forca interna em todos os DOFs dos nos "
+    "do NSET (num DOF livre carregado entra a propria carga). Medido no ccx 2.23 em 21/11/2026."
+)
+
+
+def node_print_rf_totals(V, model, f_int_arr, locator=None) -> Dict[str, Any]:
+    """Totais de RF por NSET pedidos em *NODE PRINT ... RF, na definicao do CalculiX."""
+    rec = getattr(model, "fc_record", None)
+    reqs = [r for r in (rec.requests if rec else [])
+            if r.kind == "node_print" and r.nset and "RF" in [f.upper() for f in r.fields]]
+    if not reqs:
+        return {}
+    locator = locator or component_dof_locator(V)
+    nsets = {k.upper(): v for k, v in model.nsets.items()}
+    out: Dict[str, Any] = {}
+    for r in reqs:
+        ids = nsets.get(r.nset.upper())
+        if ids is None or r.nset in out:
+            continue
+        tot = [0.0, 0.0, 0.0]
+        for nid in sorted({int(i) for i in ids}):
+            node = model.nodes.get(nid)
+            if node is None:
+                continue
+            for comp in range(3):
+                parent, _pair, _vcol = locator.locate(node, comp)
+                if parent.size:
+                    tot[comp] += float(f_int_arr[int(parent[0])])
+        out[r.nset] = {"RFx": tot[0], "RFy": tot[1], "RFz": tot[2]}
+    return {"definition": NODE_PRINT_RF_DEFINITION, "sets": out} if out else {}
+
+
 def check_solution_finite(uh, solver=None) -> None:
     arr = np.asarray(uh.x.array)
     if arr.size == 0 or not np.isfinite(arr).all():

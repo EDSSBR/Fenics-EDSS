@@ -57,6 +57,13 @@ class Material:
     mu: Optional[float] = None
     lmbda: Optional[float] = None
     hyperelastic: bool = False
+    # *HYPERELASTIC: forma (parametro do cartao, ex. "NEO HOOKE"), C10 e D1 do CalculiX,
+    # numero de linhas de dados (mais de uma = dependente de temperatura) e linha do cartao.
+    hyper_model: Optional[str] = None
+    hyper_c10: Optional[float] = None
+    hyper_d1: Optional[float] = None
+    hyper_n_lines: int = 0
+    hyper_line: int = 0
     has_elastic: bool = False
     has_conductivity: bool = False
 
@@ -97,6 +104,9 @@ class Step:
     static_increments: Optional[List[float]] = None
     step_params: List[str] = field(default_factory=list)
     start_time: float = 0.0
+    # NLGEOM do *STEP: None (nao informado), "YES" ou "NO". O CalculiX ignora NLGEOM no *STATIC.
+    nlgeom_param: Optional[str] = None
+    static_direct: bool = False
 
 
 @dataclass
@@ -336,17 +346,27 @@ def parse_inp(path: str, debug: int = 0, profile: Optional[str] = None) -> INPMo
             mat = model.materials[current_material]
             mat.hyperelastic = True
             model.hyperelastic = True
+            mat.hyper_line = lineno
+            forms = [p.strip().upper() for p in keyword_params(line)]
+            mat.hyper_model = " ".join(forms) if forms else ""
             i += 1
             while i < len(lines) and not _is_keyword_line(lines[i]):
                 data = lines[i].strip()
                 if data and not data.startswith("**"):
                     parts = [p.strip() for p in data.split(",") if p.strip()]
-                    if parts:
-                        mat.mu = float(parts[0])
-                    if len(parts) >= 2:
-                        mat.lmbda = float(parts[1])
-                    i += 1
-                    break
+                    mat.hyper_n_lines += 1
+                    if mat.hyper_n_lines == 1:
+                        try:
+                            vals = [float(p) for p in parts]
+                        except ValueError as exc:
+                            raise FCProfileError(
+                                "L{0}: *HYPERELASTIC com valor invalido: {1}".format(i + 1, data)) from exc
+                        if vals:
+                            mat.mu = vals[0]
+                            mat.hyper_c10 = vals[0]
+                        if len(vals) >= 2:
+                            mat.lmbda = vals[1]
+                            mat.hyper_d1 = vals[1]
                 i += 1
             continue
 
@@ -479,6 +499,14 @@ def parse_inp(path: str, debug: int = 0, profile: Optional[str] = None) -> INPMo
             current_step.step_params = keyword_params(line)
             current_step.start_time = 0.0
             for param in current_step.step_params:
+                pname, _eq, pval = param.partition("=")
+                if pname.strip().upper() == "NLGEOM":
+                    pval = pval.strip().upper()
+                    current_step.nlgeom_param = "NO" if pval == "NO" else "YES"
+                    if current_step.nlgeom_param == "YES":
+                        current_step.nlgeom = True
+                        model.nlgeom = True
+            for param in current_step.step_params:
                 pname = param.split("=", 1)[0].strip().upper()
                 if (key, pname) in EXPLICITLY_IGNORED_PARAMS:
                     fc_record.ignored.append(
@@ -500,10 +528,17 @@ def parse_inp(path: str, debug: int = 0, profile: Optional[str] = None) -> INPMo
             continue
 
         if key == "STATIC":
-            if "NLGEOM" in upper:
-                model.nlgeom = True
-                if current_step:
-                    current_step.nlgeom = True
+            static_params = [p.split("=", 1)[0].strip().upper() for p in keyword_params(line)]
+            if "NLGEOM" in static_params:
+                # Medido no ccx 2.23 (21/11/2026): "*WARNING reading *STATIC: parameter not
+                # recognized: NLGEOM" -- o CalculiX ignora; NLGEOM so vale no *STEP.
+                fc_record.ignored.append(IgnoredItem(
+                    "STATIC",
+                    "NLGEOM no *STATIC e ignorado pelo CalculiX (parametro so de *STEP); "
+                    "o FenicsEDSS segue o CalculiX",
+                    lineno, line.strip()))
+            if current_step and "DIRECT" in static_params:
+                current_step.static_direct = True
             model.analysis_type = "static"
             if current_step:
                 current_step.analysis_type = "static"
@@ -757,7 +792,18 @@ def materials_by_element_strict(model: INPModel, need: str) -> Dict[int, Materia
             len(missing), missing[:5]))
     used = {id(m): m for m in mapping.values()}.values()
     for mat in used:
-        if need == "elastic":
+        if need == "mechanical" and mat.hyperelastic:
+            if mat.has_elastic:
+                errors.append("Material {0} com *ELASTIC e *HYPERELASTIC ao mesmo tempo: nao implementado".format(
+                    mat.name))
+            elif mat.hyper_c10 is None or mat.hyper_d1 is None:
+                errors.append("Material {0}: *HYPERELASTIC, NEO HOOKE exige C10 e D1".format(mat.name))
+            elif not (mat.hyper_c10 > 0):
+                errors.append("Material {0}: C10={1} invalido (> 0)".format(mat.name, mat.hyper_c10))
+            elif not (mat.hyper_d1 > 0):
+                errors.append("Material {0}: D1={1} (incompressivel) nao implementado; use D1 > 0".format(
+                    mat.name, mat.hyper_d1))
+        elif need in ("elastic", "mechanical"):
             if not mat.has_elastic:
                 errors.append("Material {0} sem *ELASTIC".format(mat.name))
             elif not (mat.E > 0) or not (-1.0 < mat.nu < 0.5):
@@ -832,6 +878,8 @@ def effective_steps(model: INPModel) -> List[Step]:
             analysis_type=step.analysis_type,
             static_increments=step.static_increments,
             step_params=list(step.step_params),
+            nlgeom_param=step.nlgeom_param,
+            static_direct=step.static_direct,
             start_time=step.start_time,
             heat_steady=step.heat_steady,
             line=step.line,

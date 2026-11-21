@@ -70,13 +70,10 @@ def _steps(tmp_path, text):
 
 # --- capacidades -----------------------------------------------------------
 
-def test_hyper_e_nlgeom_dao_nao_implementado():
+def test_hyper_neo_hooke_e_aceito():
+    # passo 7 (21/11/2026): *HYPERELASTIC, NEO HOOKE + NLGEOM implementados (tests/test_hyper.py)
     model = parse_inp(example("beam_hyper.inp"))
-    with pytest.raises(InpNotImplementedError) as exc:
-        validate_capabilities(model)
-    msg = str(exc.value)
-    assert "HYPERELASTIC nao implementado" in msg
-    assert "NLGEOM" in msg
+    validate_capabilities(model)
 
 
 @pytest.mark.parametrize("card,frag", [

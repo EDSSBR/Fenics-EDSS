@@ -33,7 +33,7 @@ IMPLEMENTED_ELEMENTS = {"C3D4", "C3D8", "C3D10"}
 # Cartoes interpretados pelo solver.
 IMPLEMENTED_KEYWORDS = {
     "NODE", "ELEMENT", "NSET", "ELSET", "MATERIAL", "ELASTIC", "CONDUCTIVITY",
-    "SOLID SECTION", "BOUNDARY", "CLOAD", "DLOAD", "STEP", "STATIC",
+    "SOLID SECTION", "BOUNDARY", "CLOAD", "DLOAD", "STEP", "STATIC", "HYPERELASTIC",
     "HEAT TRANSFER", "END STEP", "NODE FILE", "EL FILE", "NODE PRINT",
     "EL PRINT", "OUTPUT",
 }
@@ -50,7 +50,7 @@ IGNORED_KEYWORDS = {
 
 # Cartoes conhecidos do CalculiX que ainda nao estao implementados.
 NOT_IMPLEMENTED_KEYWORDS = {
-    "HYPERELASTIC", "PLASTIC", "CREEP", "VISCO", "USER MATERIAL", "DEFORMATION PLASTICITY",
+    "HYPERFOAM", "PLASTIC", "CREEP", "VISCO", "USER MATERIAL", "DEFORMATION PLASTICITY",
     "NLGEOM", "FREQUENCY", "BUCKLE", "DYNAMIC", "MODAL DYNAMIC", "STEADY STATE DYNAMICS",
     "COMPLEX FREQUENCY", "COUPLED TEMPERATURE-DISPLACEMENT", "UNCOUPLED TEMPERATURE-DISPLACEMENT",
     "THERMAL-ELECTRICAL", "ELECTROMAGNETICS", "SENSITIVITY", "VISCO",
@@ -62,6 +62,32 @@ NOT_IMPLEMENTED_KEYWORDS = {
     "MASS", "SURFACE", "RESTART", "CHANGE MATERIAL", "MODEL CHANGE", "SUBMODEL",
     "PRE-TENSION SECTION", "DISTRIBUTION", "USER ELEMENT", "BOUNDARYF",
 }
+
+# Formas de *HYPERELASTIC implementadas (parametro do cartao, sem espacos/hifens).
+HYPERELASTIC_FORMS = {"NEOHOOKE"}
+
+
+def nlgeom_by_step(model) -> List[bool]:
+    """NLGEOM efetivo de cada passo, como o CalculiX 2.23 (medido em 21/11/2026).
+
+    * NLGEOM so vale no *STEP (no *STATIC o ccx avisa e ignora).
+    * Uma vez ligado, continua nos passos seguintes que nao dizem nada.
+    * *HYPERELASTIC liga NLGEOM no modelo inteiro ("*INFO reading *HYPERELASTIC:
+      nonlinear geometric effects are turned on").
+    * NLGEOM=NO depois de um passo nao linear: o ccx faz outra coisa (nao e o
+      linear a partir do zero); recusado em validate_capabilities.
+    """
+    on = bool(getattr(model, "hyperelastic", False))
+    out = []
+    for step in model.steps:
+        p = getattr(step, "nlgeom_param", None)
+        if p == "YES":
+            on = True
+        elif p == "NO" and not on:
+            on = False
+        out.append(on)
+    return out
+
 
 # Tipos de *DLOAD implementados: pressao uniforme nas faces P1..P6.
 DLOAD_PRESSURE_FACES = {"P1", "P2", "P3", "P4", "P5", "P6"}
@@ -124,9 +150,15 @@ def validate_capabilities(model) -> None:
             errors.append("L{0}: cartao nao reconhecido pelo FenicsEDSS: {1}".format(lineno, header.strip()))
             continue
         up = header.upper().replace(" ", "")
-        if key in ("STATIC", "STEP") and _has_param(header, "NLGEOM"):
-            errors.append("L{0}: NLGEOM (nao linearidade geometrica) nao implementado. Cartao: {1}".format(
-                lineno, header.strip()))
+        if key == "HYPERELASTIC":
+            params = [p.split("=", 1)[0].strip().upper() for p in keyword_params(header)]
+            forms = [p.replace(" ", "").replace("-", "") for p in params]
+            if not forms:
+                errors.append("L{0}: *HYPERELASTIC sem forma (o CalculiX usa POLYNOMIAL N=1, Mooney-Rivlin) "
+                              "nao implementado; so NEO HOOKE. Cartao: {1}".format(lineno, header.strip()))
+            elif any(f not in HYPERELASTIC_FORMS for f in forms):
+                errors.append("L{0}: *HYPERELASTIC {1} nao implementado (so NEO HOOKE). Cartao: {2}".format(
+                    lineno, ", ".join(params), header.strip()))
         if key == "STEP" and _has_param(header, "PERTURBATION"):
             errors.append("L{0}: *STEP, PERTURBATION nao implementado.".format(lineno))
         if key == "HEAT TRANSFER" and "STEADYSTATE" not in up:
@@ -158,6 +190,27 @@ def validate_capabilities(model) -> None:
                 t, sorted(IMPLEMENTED_ELEMENTS)))
     if len(types) > 1:
         errors.append("Malha com tipos de elemento misturados nao implementada: {0}.".format(types))
+
+    for mat in model.materials.values():
+        if getattr(mat, "hyperelastic", False) and getattr(mat, "hyper_n_lines", 0) > 1:
+            errors.append("L{0}: *HYPERELASTIC do material {1} com {2} linhas (dependente de temperatura) "
+                          "nao implementado.".format(mat.hyper_line, mat.name, mat.hyper_n_lines))
+    on = bool(getattr(model, "hyperelastic", False))
+    for n, step in enumerate(model.steps, start=1):
+        p = getattr(step, "nlgeom_param", None)
+        if p == "NO" and on:
+            errors.append("Passo {0}: NLGEOM=NO depois de passo nao linear{1} nao implementado "
+                          "(o CalculiX nao volta ao linear do zero).".format(
+                              n, " (o *HYPERELASTIC liga NLGEOM)" if model.hyperelastic else ""))
+        if p == "YES":
+            on = True
+    nl = nlgeom_by_step(model)
+    for n, (step, is_nl) in enumerate(zip(model.steps, nl), start=1):
+        if is_nl and step.dloads:
+            errors.append("Passo {0}: *DLOAD com NLGEOM nao implementado (no CalculiX a pressao "
+                          "acompanha a deformacao, carga seguidora).".format(n))
+        if is_nl and step.analysis_type == "heat":
+            errors.append("Passo {0}: NLGEOM em passo termico nao implementado.".format(n))
 
     kinds = {s.analysis_type for s in model.steps}
     if len(kinds) > 1:

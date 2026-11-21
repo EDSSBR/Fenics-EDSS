@@ -43,7 +43,9 @@ def test_heat_transfer_roteia_termico():
 def test_hyperelastic_roteia_e_le_parametros():
     model = parse_inp(example("beam_hyper.inp"))
     assert model.hyperelastic is True
-    assert model.nlgeom is True
+    # o deck usa "*STATIC, NLGEOM", que o CalculiX ignora (NLGEOM e parametro de *STEP);
+    # quem liga NLGEOM aqui e o *HYPERELASTIC (inp_capabilities.nlgeom_by_step)
+    assert model.nlgeom is False
     borracha = next(m for m in model.materials.values() if m.hyperelastic)
     assert borracha.mu == 1.0
     assert borracha.lmbda == 0.1

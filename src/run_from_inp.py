@@ -2,8 +2,9 @@
 """
 Executa a analise de um .inp do CalculiX (um caminho so, guiado pelo deck).
 
-Estatica linear (C3D4, C3D8, C3D10; varios *STEP; *CLOAD; *DLOAD pressao) e
-termica estacionaria. O que nao e implementado falha com erro explicito
+Estatica linear (C3D4, C3D8, C3D10; varios *STEP; *CLOAD; *DLOAD pressao),
+estatica com NLGEOM (Neo-Hooke e *ELASTIC como St. Venant-Kirchhoff; fc_nonlinear.py)
+e termica estacionaria. O que nao e implementado falha com erro explicito
 (inp_capabilities.py). ``--profile fc`` so acrescenta as restricoes do perfil
 FC; ``--restrictions`` aplica as restricoes do arquivo de configuracao.
 """
@@ -26,7 +27,7 @@ from inp_parser import (
     parse_inp, summary, Step, select_analysis, get_material_for_element,
     effective_steps, materials_by_element_strict,
 )
-from inp_capabilities import apply_restrictions, ignored_items, validate_capabilities
+from inp_capabilities import apply_restrictions, ignored_items, nlgeom_by_step, validate_capabilities
 from job_io import (
     USAGE,
     parse_run_args,
@@ -194,7 +195,8 @@ class StaticContext:
         log_fc_stage("functionspace", t0, stages)
 
         # Materiais por celula (DG-0), via *SOLID SECTION, sem material padrao.
-        mats = materials_by_element_strict(model, "elastic")
+        # "mechanical": *ELASTIC ou *HYPERELASTIC (Neo-Hooke so entra nos passos NLGEOM).
+        mats = materials_by_element_strict(model, "mechanical")
         Q = fem.functionspace(domain, ("DG", 0))
         E_func = fem.Function(Q)
         nu_func = fem.Function(Q)
@@ -203,6 +205,8 @@ class StaticContext:
             cell_idx = self.eid_to_cell[eid]
             if cell_idx >= ncell:
                 raise RuntimeError("Indice de celula fora do espaco DG0 (serial esperado).")
+            if mat.hyperelastic:
+                continue
             E_func.x.array[cell_idx] = mat.E
             nu_func.x.array[cell_idx] = mat.nu
         E_func.x.scatter_forward()
@@ -370,6 +374,8 @@ def run_from_inp(inp_path: str, output_dir: str = "/app/output", debug: int = 0,
         return {"parse_only": True, "model": model, "report": payload}
 
     steps = effective_steps(model)
+    nl_flags = nlgeom_by_step(model)
+    nl_state = {}
     results = []
     ctx = None
     for i, step in enumerate(steps):
@@ -386,10 +392,20 @@ def run_from_inp(inp_path: str, output_dir: str = "/app/output", debug: int = 0,
         else:
             if ctx is None:
                 ctx = StaticContext(model, debug=debug, stages=[] if mem_profile_enabled() else None)
-            result, extra = run_linear_static_step(
-                model, step, output_base, debug, profile=profile,
-                solver=solver, rtol=rtol, ctx=ctx, auto_lu_max_dofs=auto_lu_max_dofs,
-            )
+            if nl_flags[i]:
+                from fc_nonlinear import run_nlgeom_step
+                result, extra = run_nlgeom_step(
+                    model, step, output_base, ctx, nl_state, solver=solver, rtol=rtol,
+                    auto_lu_max_dofs=auto_lu_max_dofs, debug=debug,
+                )
+            else:
+                result, extra = run_linear_static_step(
+                    model, step, output_base, debug, profile=profile,
+                    solver=solver, rtol=rtol, ctx=ctx, auto_lu_max_dofs=auto_lu_max_dofs,
+                )
+                # passo NLGEOM seguinte parte deste estado (o ccx faz o mesmo)
+                nl_state["u"] = result
+                nl_state["loads_step"] = step
         extra["step"] = step_num
         extra["output_base"] = os.path.basename(output_base)
         results.append((result, extra))
@@ -474,6 +490,8 @@ def _write_fc_linear_fields(domain, uh, v, sigma, epsilon, f_ext, a_form, model,
     applied = applied or {"Fx": 0.0, "Fy": 0.0, "Fz": 0.0}
     coords_by_nid = {nid: (n.x, n.y, n.z) for nid, n in model.nodes.items()}
     rx = residual_on_constrained(f_int, f_ext, constrained_rows, coords_by_nid)
+    from fc_assembly import node_print_rf_totals, vec_as_array
+    np_totals = node_print_rf_totals(uh.function_space, model, vec_as_array(f_int))
 
     V = uh.function_space
     rf = fem.Function(V)
@@ -543,6 +561,7 @@ def _write_fc_linear_fields(domain, uh, v, sigma, epsilon, f_ext, a_form, model,
         "sum_R_plus_F": sum_rf,
         "loads_on_constrained_dofs": ext_c,
         "rf_definition": "CalculiX: RF = K u nos DOFs prescritos (carga num DOF prescrito vai direto ao apoio)",
+        "node_print_totals": np_totals,
         "moment_R_origin": rx["moment_R_origin"],
         "moment_F_origin": mom_f,
         "moment_R_plus_F_origin": mom_sum,
@@ -720,7 +739,9 @@ def _finalize_fc_run(model, output_dir, inp_path, units_norm, results, debug, ru
         "n_nodes": len(model.nodes),
         "n_elements": len(model.elements),
         "materials": {
-            name: {"E": mat.E, "nu": mat.nu} for name, mat in model.materials.items()
+            name: ({"hyperelastic": mat.hyper_model, "C10": mat.hyper_c10, "D1": mat.hyper_d1}
+                   if mat.hyperelastic else {"E": mat.E, "nu": mat.nu})
+            for name, mat in model.materials.items()
         },
         "ignored_cards": [
             {"keyword": it.keyword, "reason": it.reason, "line": it.line, "detail": it.detail}
@@ -735,7 +756,7 @@ def _finalize_fc_run(model, output_dir, inp_path, units_norm, results, debug, ru
         "field_contract": {
             "U": "nodal Lagrange P1",
             "S": "Cauchy cell DG0, constant on C3D4 P1; not nodal-smoothed; symmetrized before principals",
-            "E": "infinitesimal strain cell DG0",
+            "E": "infinitesimal strain cell DG0 (passos lineares); Green-Lagrange (passos NLGEOM)",
             "PRINCIPAL": "algebraic sigma1>=sigma2>=sigma3 with sign, cell DG0",
             "VON_MISES": "cell DG0",
             "RF": "residual K_full u - f_ext at constrained DOFs only, plus force/moment totals",
