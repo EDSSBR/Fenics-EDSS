@@ -1,0 +1,20 @@
+# Configuração de solver FemEDSS — exemplo CalculiX (valores padrão atuais).
+# Envie este arquivo (ou uma cópia editada) na tela de nova simulação.
+# Chaves desconhecidas ou valores inválidos geram erro; não há fallback silencioso.
+#
+# O solver de equações do CalculiX (SPOOLES, ITERATIVE CHOLESKY, etc.)
+# NÃO pode ser escolhido aqui: o ccx 2.23 desta imagem só aceita essa
+# escolha no próprio .inp (*STATIC, SOLVER=...). Não altere o .inp
+# automaticamente; se precisar de outro solver de equações, isso é
+# uma decisão explícita sobre o deck.
+
+solver: calculix
+
+calculix:
+  image: ubuntu-calculix:condaforge-2.23
+  threads: 8
+resources:
+  memory_gb: 2
+  memory_swap_gb: 4
+  cpus: 4
+  timeout_s: 3600

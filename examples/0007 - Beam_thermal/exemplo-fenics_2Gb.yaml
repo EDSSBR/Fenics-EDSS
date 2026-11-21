@@ -1,0 +1,21 @@
+# Configuração de solver FemEDSS — exemplo FEniCS (perfil FC, valores padrão atuais).
+# Envie este arquivo (ou uma cópia editada) na tela de nova simulação.
+# Chaves desconhecidas ou valores inválidos geram erro; não há fallback silencioso.
+
+solver: fenics # `calculix`, `fenics` or `opencourant`.
+
+fenics:
+  profile: fc
+  solver: lu          # cg-gamg ou lu (sem fallback automático)
+                      # `cg-gamg` is the iterative solver (conjugate gradient with an algebraic multigrid preconditioner). It's light on memory and is what ran the wheel: 122 iterations, about 8 GB.
+                      # `lu` is the direct solver. It's exact, but for the wheel's 2.2 million degrees of freedom it would need far more RAM. In practice it's only useful for small models or as a check.
+
+  rtol: 1e-10             # obrigatório <= 1e-10 quando solver é cg-gamg
+                          # any positive, finite number. With `cg-gamg` it must be `1e-10` or smaller, so `1e-11` and `1e-12` are fine. With `lu` the app accepts any positive value, though for a direct solver it should make little difference to the answer.
+  units: mm-N-MPa-t-s      # obrigatório no perfil FC
+
+resources:
+  memory_gb: 2.0    # RAM in GiB, greater than 0 and up to 512.
+                    # memory_swap_gb =10 is optional and missing from your example. It's the container's RAM plus swap total, so it must be at least `memory_gb`, and it can't exceed this machine's RAM plus swap. If you leave it out, the container gets no swap.
+  cpus: 4           # greater than 0 and up to 128, and fractions like `2.5` are allowed. It caps how much CPU the container can use (Docker's `--cpus`). It doesn't set the number of solver processes, and I didn't find a separate thread or MPI-process setting for FeniCS.
+  timeout_s: 3600   # an integer from 1 up to 604800 (7 days). After that the job is killed.
