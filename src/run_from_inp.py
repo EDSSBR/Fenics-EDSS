@@ -132,6 +132,22 @@ def build_mesh_from_inp(model, debug=0):
     return domain, node_map
 
 
+CCX_QUADRATURE_DEGREE = {"C3D8": 2, "C3D10": 2}
+
+
+def element_dx(domain, etype: str):
+    """Medida de integracao com a regra do CalculiX para o elemento.
+
+    C3D8: Gauss 2x2x2 (grau 2 no hexaedro); C3D10: 4 pontos (grau 2 no tetraedro);
+    C3D4: padrao (integrando constante, qualquer regra e exata). Em elemento distorcido
+    ou curvo a regra muda o resultado, por isso segue a do CalculiX.
+    """
+    deg = CCX_QUADRATURE_DEGREE.get(etype.upper())
+    if deg is None:
+        return ufl.dx(domain=domain)
+    return ufl.dx(domain=domain, metadata={"quadrature_degree": deg})
+
+
 def element_degree(model) -> int:
     """Grau do espaco de deslocamento: 2 para C3D10, 1 para C3D4/C3D8."""
     first = next(iter(model.elements.values()))
@@ -209,8 +225,9 @@ class StaticContext:
         self.sigma = sigma
         u = ufl.TrialFunction(self.V)
         self.v = ufl.TestFunction(self.V)
-        a = ufl.inner(sigma(u), epsilon(self.v)) * ufl.dx
-        L_form = ufl.dot(fem.Constant(domain, default_scalar_type((0.0, 0.0, 0.0))), self.v) * ufl.dx
+        self.dx = element_dx(domain, self.etype)
+        a = ufl.inner(sigma(u), epsilon(self.v)) * self.dx
+        L_form = ufl.dot(fem.Constant(domain, default_scalar_type((0.0, 0.0, 0.0))), self.v) * self.dx
         self.a_form = fem.form(a)
         self.L_compiled = fem.form(L_form)
         self.ndofs = int(self.V.dofmap.index_map.size_global * self.V.dofmap.index_map_bs)
@@ -382,19 +399,22 @@ def run_from_inp(inp_path: str, output_dir: str = "/app/output", debug: int = 0,
     return results
 
 def _cell_average_tensor(ctx, expr, name: str):
-    """Media do tensor na celula (DG0) com a mesma quadratura do CalculiX.
+    """Media aritmetica do tensor nos pontos de integracao do CalculiX (DG0).
 
-    C3D8: Gauss 2x2x2; C3D10: 4 pontos. Para celula de jacobiano constante e a
-    media dos valores nos pontos de integracao (o que o *EL PRINT do ccx lista).
+    C3D8: Gauss 2x2x2; C3D10: 4 pontos (pesos iguais nas duas regras). Dividir o
+    integrando por |det J| deixa so os pesos de referencia, entao o resultado e a
+    media simples dos valores nos pontos (o que o *EL PRINT do ccx lista), tambem
+    em elemento distorcido ou curvo.
     """
     from dolfinx import fem
     W = fem.functionspace(ctx.domain, ("DG", 0, (3, 3)))
     w = ufl.TestFunction(W)
     one = fem.functionspace(ctx.domain, ("DG", 0))
     q = ufl.TestFunction(one)
-    md = {"quadrature_degree": 2}
-    num = assemble_vector(fem.form(ufl.inner(expr, w) * ufl.dx(metadata=md)))
-    vol = assemble_vector(fem.form(q * ufl.dx(metadata=md)))
+    dx = element_dx(ctx.domain, ctx.etype)
+    inv_j = 1.0 / abs(ufl.JacobianDeterminant(ctx.domain))
+    num = assemble_vector(fem.form(inv_j * ufl.inner(expr, w) * dx))
+    vol = assemble_vector(fem.form(inv_j * q * dx))
     func = fem.Function(W)
     func.name = name
     vals = np.asarray(num.array).reshape(-1, 9) / np.asarray(vol.array).reshape(-1, 1)
@@ -443,7 +463,8 @@ def _write_fc_linear_fields(domain, uh, v, sigma, epsilon, f_ext, a_form, model,
     )
 
     # R = K u - f_ext (assemble_vector esparso), somente nos DOFs prescritos (livres ~0).
-    f_int = assemble_vector(fem.form(ufl.inner(sigma(uh), epsilon(v)) * ufl.dx))
+    dx_el = ctx.dx if ctx is not None else ufl.dx
+    f_int = assemble_vector(fem.form(ufl.inner(sigma(uh), epsilon(v)) * dx_el))
     try:
         f_int.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
     except Exception:

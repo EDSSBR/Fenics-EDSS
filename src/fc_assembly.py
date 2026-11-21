@@ -139,7 +139,14 @@ def inp_node_to_geom(domain, model, atol: float = 1e-9) -> Dict[int, int]:
     lookup = CoordLookup(coords, atol=atol, loose=1e-6)
     mapping: Dict[int, int] = {}
     used: Dict[int, int] = {}
+    # So nos usados por algum elemento entram na malha (o CalculiX aceita nos soltos).
+    # BOUNDARY/CLOAD num no solto falha depois com erro explicito (sem DOF).
+    in_elements = set()
+    for el in model.elements.values():
+        in_elements.update(el.nodes)
     for nid, node in model.nodes.items():
+        if nid not in in_elements:
+            continue
         target = (node.x, node.y, node.z)
         gi, status, mind = lookup.find(target)
         if status == "missing":
@@ -319,7 +326,8 @@ def apply_cloads(V, b, model, step, profile_fc: bool) -> Dict[str, float]:
         if parent.size == 0:
             if profile_fc:
                 raise FCProfileError(
-                    "CLOAD no INP {0} dof {1} nao localizou DOF no espaco DOLFINx.".format(
+                    "CLOAD no INP {0} dof {1} nao localizou DOF no espaco DOLFINx "
+                    "(o no pertence a algum elemento?).".format(
                         cl.node, cl.dof
                     )
                 )
@@ -365,7 +373,8 @@ def collect_constrained_dofs(V, model, profile_fc: bool, boundary=None):
         if parent.size == 0:
             if profile_fc:
                 raise FCProfileError(
-                    "BOUNDARY no INP {0} dof {1} nao localizou DOF no espaco DOLFINx.".format(
+                    "BOUNDARY no INP {0} dof {1} nao localizou DOF no espaco DOLFINx "
+                    "(o no pertence a algum elemento?).".format(
                         bc.node, bc.dof
                     )
                 )

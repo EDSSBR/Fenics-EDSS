@@ -117,7 +117,7 @@ def run_heat_steady(model, step, output_base: str, debug: int = 0, solver: str =
     from fc_solver import solve_linear
     from inp_parser import materials_by_element_strict
     from job_io import normalize_rtol, normalize_solver
-    from run_from_inp import build_mesh_from_inp, element_degree, resolve_solver_choice
+    from run_from_inp import build_mesh_from_inp, element_degree, element_dx, resolve_solver_choice
 
     solver = normalize_solver(solver)
     rtol = normalize_rtol(rtol, solver)
@@ -163,8 +163,9 @@ def run_heat_steady(model, step, output_base: str, debug: int = 0, solver: str =
 
     u = ufl.TrialFunction(V)
     v = ufl.TestFunction(V)
-    a_form = fem.form(k_func * ufl.inner(ufl.grad(u), ufl.grad(v)) * ufl.dx)
-    L_form = fem.form(fem.Constant(domain, default_scalar_type(0.0)) * v * ufl.dx)
+    dx = element_dx(domain, next(iter(model.elements.values())).type)
+    a_form = fem.form(k_func * ufl.inner(ufl.grad(u), ufl.grad(v)) * dx)
+    L_form = fem.form(fem.Constant(domain, default_scalar_type(0.0)) * v * dx)
     A = assemble_matrix(a_form, bcs=bcs)
     A.assemble()
     b = assemble_vector(L_form)
