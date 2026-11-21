@@ -485,10 +485,12 @@ def _write_fc_linear_fields(domain, uh, v, sigma, epsilon, f_ext, a_form, model,
     rf_pvd = write_functions_vtk(domain.comm, [rf], output_base + "_RF")
 
     totals = rx["totals"]
+    ext_c = rx["ext_on_constrained"]
+    # RF no padrao do CalculiX (f_int); cargas em DOFs prescritos ficam fora do equilibrio.
     sum_rf = {
-        "Fx": totals["RFx"] + applied["Fx"],
-        "Fy": totals["RFy"] + applied["Fy"],
-        "Fz": totals["RFz"] + applied["Fz"],
+        "Fx": totals["RFx"] + applied["Fx"] - ext_c["Fx"],
+        "Fy": totals["RFy"] + applied["Fy"] - ext_c["Fy"],
+        "Fz": totals["RFz"] + applied["Fz"] - ext_c["Fz"],
     }
     # Momento das cargas aplicadas em torno da origem.
     mom_f = {"Mx": 0.0, "My": 0.0, "Mz": 0.0}
@@ -504,10 +506,11 @@ def _write_fc_linear_fields(domain, uh, v, sigma, epsilon, f_ext, a_form, model,
         mom_f["Mx"] += n.y * fz - n.z * fy
         mom_f["My"] += n.z * fx - n.x * fz
         mom_f["Mz"] += n.x * fy - n.y * fx
+    ext_cm = rx["moment_ext_on_constrained_origin"]
     mom_sum = {
-        "Mx": rx["moment_R_origin"]["Mx"] + mom_f["Mx"],
-        "My": rx["moment_R_origin"]["My"] + mom_f["My"],
-        "Mz": rx["moment_R_origin"]["Mz"] + mom_f["Mz"],
+        "Mx": rx["moment_R_origin"]["Mx"] + mom_f["Mx"] - ext_cm["Mx"],
+        "My": rx["moment_R_origin"]["My"] + mom_f["My"] - ext_cm["My"],
+        "Mz": rx["moment_R_origin"]["Mz"] + mom_f["Mz"] - ext_cm["Mz"],
     }
     force_char = 0.0
     moment_char = 0.0
@@ -538,6 +541,8 @@ def _write_fc_linear_fields(domain, uh, v, sigma, epsilon, f_ext, a_form, model,
         "totals": totals,
         "applied_totals": applied,
         "sum_R_plus_F": sum_rf,
+        "loads_on_constrained_dofs": ext_c,
+        "rf_definition": "CalculiX: RF = K u nos DOFs prescritos (carga num DOF prescrito vai direto ao apoio)",
         "moment_R_origin": rx["moment_R_origin"],
         "moment_F_origin": mom_f,
         "moment_R_plus_F_origin": mom_sum,
@@ -565,7 +570,7 @@ def _write_fc_linear_fields(domain, uh, v, sigma, epsilon, f_ext, a_form, model,
         # Momento da pressao (somado como forcas nodais consistentes).
         for key in ("Mx", "My", "Mz"):
             mom_f[key] += pressure["M"][key]
-        mom_sum = {k: rx["moment_R_origin"][k] + mom_f[k] for k in ("Mx", "My", "Mz")}
+        mom_sum = {k: rx["moment_R_origin"][k] + mom_f[k] - ext_cm[k] for k in ("Mx", "My", "Mz")}
         force_char += pressure["force_char"]
         moment_char += pressure["moment_char"]
         payload["moment_F_origin"] = mom_f

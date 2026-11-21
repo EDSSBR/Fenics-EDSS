@@ -419,10 +419,13 @@ def collect_constrained_dofs(V, model, profile_fc: bool, boundary=None):
 def residual_on_constrained(
     f_int, f_ext, constrained_rows, coords_by_nid: Dict[int, Tuple[float, float, float]]
 ) -> Dict[str, Any]:
-    """R = f_int - f_ext somente nos DOFs prescritos.
+    """Reacao nos DOFs prescritos com a definicao do CalculiX: RF = f_int (K u).
 
-    f_int deve vir da forma bilinear sem BC (assemble_vector de K u, esparso).
-    Livres devem ter residual ~0. Nao monta K denso.
+    Medido no ccx 2.23 (21/11/2026): carga (*CLOAD ou pressao) aplicada num DOF
+    prescrito nao entra no RF do .dat; ela vai direto para o apoio. Por isso
+    RF = f_int no DOF prescrito, e as cargas nesses DOFs sao reportadas a parte
+    (``ext_on_constrained``) para o equilibrio: RF + (F aplicada - F nos prescritos) = 0.
+    Livres devem ter f_int - f_ext ~0. f_int vem da forma bilinear sem BC (esparso).
     """
     r_all = vec_as_array(f_int)
     ext = vec_as_array(f_ext)
@@ -433,6 +436,8 @@ def residual_on_constrained(
     totals = {"RFx": 0.0, "RFy": 0.0, "RFz": 0.0}
     keys = ("RFx", "RFy", "RFz")
     moments = {"Mx": 0.0, "My": 0.0, "Mz": 0.0}
+    ext_c = {"Fx": 0.0, "Fy": 0.0, "Fz": 0.0}
+    ext_c_m = {"Mx": 0.0, "My": 0.0, "Mz": 0.0}
     rf_nonzero = np.zeros_like(residual)
     listed = []
     used = set()
@@ -442,10 +447,18 @@ def residual_on_constrained(
         if (nid, comp) in used:
             continue
         used.add((nid, comp))
-        val = float(residual[dof])
+        val = float(r_all[dof])
         rf_nonzero[dof] = val
         totals[keys[comp]] += val
         x, y, z = coords_by_nid[nid]
+        e = float(ext[dof]) if dof < ext.size else 0.0
+        ext_c[("Fx", "Fy", "Fz")[comp]] += e
+        ex = e if comp == 0 else 0.0
+        ey = e if comp == 1 else 0.0
+        ez = e if comp == 2 else 0.0
+        ext_c_m["Mx"] += y * ez - z * ey
+        ext_c_m["My"] += z * ex - x * ez
+        ext_c_m["Mz"] += x * ey - y * ex
         fx = val if comp == 0 else 0.0
         fy = val if comp == 1 else 0.0
         fz = val if comp == 2 else 0.0
@@ -465,6 +478,8 @@ def residual_on_constrained(
         "rf_constrained": rf_nonzero,
         "totals": totals,
         "moment_R_origin": moments,
+        "ext_on_constrained": ext_c,
+        "moment_ext_on_constrained_origin": ext_c_m,
         "n_constrained_dofs": len(used),
         "residual_free_dofs_max_abs": float(free_abs.max()) if free_abs.size else 0.0,
         "entries": listed,

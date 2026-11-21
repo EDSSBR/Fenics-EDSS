@@ -779,14 +779,31 @@ def effective_steps(model: INPModel) -> List[Step]:
     no/dof soma; num passo novo, o no/dof informado substitui o valor anterior e os
     outros continuam; OP=NEW zera as cargas anteriores. *BOUNDARY: ultimo valor
     vence; OP=NEW remove as condicoes anteriores (inclusive as do modelo).
-    *DLOAD segue a regra do *CLOAD, por (elemento/ELSET, face).
+    *DLOAD segue a regra do *CLOAD por (elemento, face), medido no ccx 2.23 em
+    21/11/2026: a mesma face repetida no passo soma (inclusive via ELSET e via id
+    do elemento); num passo novo a face informada substitui e as outras continuam;
+    OP=NEW zera. O estado efetivo guarda um SurfaceLoad por elemento (elset = id).
     """
+    elsets_up = {name.upper(): ids for name, ids in model.elsets.items()}
+
+    def _dload_elements(ref: str) -> List[int]:
+        txt = ref.strip()
+        if txt.lstrip("-").isdigit():
+            eid = int(txt)
+            if eid not in model.elements:
+                raise FCProfileError("*DLOAD referencia elemento inexistente: {0}".format(eid))
+            return [eid]
+        ids = elsets_up.get(txt.upper())
+        if ids is None:
+            raise FCProfileError("*DLOAD referencia ELSET inexistente: {0}".format(ref))
+        return [int(e) for e in ids]
+
     out: List[Step] = []
     bc_state: Dict[Tuple[int, int], float] = {}
     for bc in model.initial_boundary:
         bc_state[(bc.node, bc.dof)] = bc.value
     cl_state: Dict[Tuple[int, int], float] = {}
-    dl_state: Dict[Tuple[str, str], float] = {}
+    dl_state: Dict[Tuple[int, str], float] = {}
     for step in model.steps:
         if step.boundary_op_new:
             bc_state = {}
@@ -801,14 +818,15 @@ def effective_steps(model: INPModel) -> List[Step]:
         cl_state.update(this_cl)
         if step.dload_op_new:
             dl_state = {}
-        this_dl: Dict[Tuple[str, str], float] = {}
+        this_dl: Dict[Tuple[int, str], float] = {}
         for dl in step.dloads:
-            key = (dl.elset, dl.face)
-            this_dl[key] = this_dl.get(key, 0.0) + dl.value
+            for eid in _dload_elements(dl.elset):
+                key = (eid, dl.face)
+                this_dl[key] = this_dl.get(key, 0.0) + dl.value
         dl_state.update(this_dl)
         eff = Step(
             loads=[ConcentratedLoad(n, d, v) for (n, d), v in cl_state.items()],
-            dloads=[SurfaceLoad(e, f, v) for (e, f), v in dl_state.items()],
+            dloads=[SurfaceLoad(str(e), f, v) for (e, f), v in sorted(dl_state.items())],
             boundary=[BoundaryCondition(n, d, v) for (n, d), v in bc_state.items()],
             nlgeom=step.nlgeom,
             analysis_type=step.analysis_type,
