@@ -5,7 +5,6 @@
 solver: fenics # `calculix`, `fenics` or `opencourant`.
 
 fenics:
-  profile: fc
   solver: lu          # cg-gamg ou lu (sem fallback automático)
                       # `cg-gamg` is the iterative solver (conjugate gradient with an algebraic multigrid preconditioner). It's light on memory and is what ran the wheel: 122 iterations, about 8 GB.
                       # `lu` is the direct solver. It's exact, but for the wheel's 2.2 million degrees of freedom it would need far more RAM. In practice it's only useful for small models or as a check.
