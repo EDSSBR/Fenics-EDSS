@@ -28,6 +28,14 @@ from job_io import parse_run_args  # noqa: E402
 
 EXAMPLES = os.path.join(ROOT, "examples")
 
+
+def example(filename):
+    """Exemplo do repo na pasta numerada (examples/NNNN - Nome/<deck>.inp); exatamente um."""
+    import glob
+    found = glob.glob(os.path.join(EXAMPLES, "[0-9][0-9][0-9][0-9] -*", filename))
+    assert len(found) == 1, (filename, found)
+    return found[0]
+
 CUBE = """*NODE
 1, 0, 0, 0
 2, 1, 0, 0
@@ -63,7 +71,7 @@ def _steps(tmp_path, text):
 # --- capacidades -----------------------------------------------------------
 
 def test_hyper_e_nlgeom_dao_nao_implementado():
-    model = parse_inp(os.path.join(EXAMPLES, "beam_hyper.inp"))
+    model = parse_inp(example("beam_hyper.inp"))
     with pytest.raises(InpNotImplementedError) as exc:
         validate_capabilities(model)
     msg = str(exc.value)
@@ -171,7 +179,7 @@ def test_dois_passos_mecanico_e_termico_nao_implementado(tmp_path):
 # --- restricoes da configuracao ---------------------------------------------
 
 def test_restricoes_da_configuracao(tmp_path):
-    model = parse_inp(os.path.join(EXAMPLES, "beam_multistep.inp"))
+    model = parse_inp(example("beam_multistep.inp"))
     apply_restrictions(model, {})
     with pytest.raises(InpRestrictedError, match="nao permitidos"):
         apply_restrictions(model, parse_restrictions('{"element_types": ["C3D4"]}'))
@@ -218,7 +226,7 @@ CCX_UMAX = {
 
 @pytest.mark.parametrize("name", sorted(CCX_UMAX))
 def test_exemplos_c3d8_batem_umax_do_ccx(tmp_path, name):
-    man, _ = _run(tmp_path, os.path.join(EXAMPLES, name + ".inp"), solver="lu")
+    man, _ = _run(tmp_path, example(name + ".inp"), solver="lu")
     got = [s["u_max"] for s in man["steps"]]
     ref = CCX_UMAX[name]
     assert len(got) == len(ref)
@@ -239,7 +247,7 @@ def test_termico_bimaterial_serie_analitico(tmp_path):
     # Conducao 1D em serie: k=50 em x<0.5 e k=200 em x>0.5, T(0)=100, T(1)=0.
     # q = 100/(0.5/50 + 0.5/200) = 8000; T(0.5) = 100 - 8000*0.01 = 20 (exato em Q1).
     pytest.importorskip("dolfinx")
-    man, out = _run(tmp_path, os.path.join(EXAMPLES, "beam_thermal.inp"), solver="lu")
+    man, out = _run(tmp_path, example("beam_thermal.inp"), solver="lu")
     s = man["steps"][0]
     assert s["analysis"] == "heat"
     assert abs(s["t_max"] - 100.0) < 1e-9 and abs(s["t_min"]) < 1e-9
@@ -253,7 +261,7 @@ def test_termico_bimaterial_serie_analitico(tmp_path):
 
 
 def test_solver_auto_escolhe_pelo_limite(tmp_path):
-    deck = os.path.join(EXAMPLES, "beam_2elem.inp")
+    deck = example("beam_2elem.inp")
     man, _ = _run(tmp_path, deck, solver="auto", auto_lu_max_dofs=1000)
     auto = man["steps"][0]["solver"]["auto"]
     assert auto["n_dofs"] == 36 and auto["chosen"] == "lu"

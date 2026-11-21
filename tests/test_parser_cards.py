@@ -15,6 +15,14 @@ from inp_parser import (  # noqa: E402
 EXAMPLES = os.path.join(ROOT, "examples")
 
 
+def example(filename):
+    """Exemplo do repo na pasta numerada (examples/NNNN - Nome/<deck>.inp); exatamente um."""
+    import glob
+    found = glob.glob(os.path.join(EXAMPLES, "[0-9][0-9][0-9][0-9] -*", filename))
+    assert len(found) == 1, (filename, found)
+    return found[0]
+
+
 def _escreve(tmp_path, nome, texto):
     path = tmp_path / nome
     path.write_text(texto, encoding="utf-8")
@@ -22,7 +30,7 @@ def _escreve(tmp_path, nome, texto):
 
 
 def test_heat_transfer_roteia_termico():
-    model = parse_inp(os.path.join(EXAMPLES, "beam_thermal.inp"))
+    model = parse_inp(example("beam_thermal.inp"))
     assert model.analysis_type == "heat"
     assert model.steps
     assert model.steps[0].analysis_type == "heat"
@@ -33,7 +41,7 @@ def test_heat_transfer_roteia_termico():
 
 
 def test_hyperelastic_roteia_e_le_parametros():
-    model = parse_inp(os.path.join(EXAMPLES, "beam_hyper.inp"))
+    model = parse_inp(example("beam_hyper.inp"))
     assert model.hyperelastic is True
     assert model.nlgeom is True
     borracha = next(m for m in model.materials.values() if m.hyperelastic)
@@ -65,7 +73,7 @@ def test_hiperelastico_sem_nlgeom_ainda_roteia(tmp_path):
 
 
 def test_estatica_linear_continua_linear():
-    model = parse_inp(os.path.join(EXAMPLES, "simple_beam.inp"))
+    model = parse_inp(example("simple_beam.inp"))
     assert model.analysis_type == "static"
     assert model.hyperelastic is False
     for step in model.steps:
